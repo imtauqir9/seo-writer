@@ -80,7 +80,7 @@ AUTHOR_CTA = """\
 
 That's a wrap for this edition. If it gave you something useful, the best next step is to try one idea for real this week.
 
-**Let's connect.** I write about what I'm building and learning with AI agents on LinkedIn — come say hi 👉 [Imran Tauqir on LinkedIn](https://www.linkedin.com/in/imrantauqir/)
+**Let's connect.** 👉 I share what I'm building and learning with AI agents on [LinkedIn](https://www.linkedin.com/in/imrantauqir/) — come say hi, and see my work in my portfolio at [imrantauqir.com](https://imrantauqir.com/).
 
 Until next time,
 **Imran**
