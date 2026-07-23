@@ -70,46 +70,13 @@ client = anthropic.Anthropic()
 # ---------------------------------------------------------------------------
 
 AUTHOR_INTRO_TEMPLATE = """\
-👋 Hi everyone, Hamza here.
-Welcome to Edition #{edition} of a newsletter that 15,000+ people around the world actually look forward to reading.
-
-We're living through a strange moment: the internet is drowning in polished AI noise that says nothing.
-This isn't that. You'll find raw, honest, human insight here — the kind that challenges how you think, not just what you know. Thanks for being part of a community that still values depth over volume.
-
-🎓 Want to up-skill in AI?
-- Join the next cohort of my **Agent Engineering Bootcamp (Developers Edition)**
-- Watch the free 4-session Agent Bootcamp playlist on YouTube
+👋 Hi everyone, Imran here.
+Welcome to Edition #{edition} of a newsletter that people around the world actually look forward to reading.
 
 ---
 """
 
-AUTHOR_CTA = """\
-
----
-
-## Did you enjoy this post?
-
-Here are some other AI Agents posts you might have missed:
-
-- KV Caching and Speculative Decoding
-- A deep dive into Quantization: Key to Open Source LLM Deployments
-- Agents are here and they are staying
-- How Agents Think
-- Memory – The Agent's Brain
-- Agentic RAG Ecosystem
-- Multimodal Agents
-- Scaling Agents: Architectures with Google ADK, A2A, and MCP
-- Fully Functional Agent Loop
-
-**Ready to take it to the next level?**
-Check out my AI Agents for Enterprise course on Maven and be part of something bigger — join hundreds of builders developing enterprise-level agents.
-
-Use this link to get **$201 OFF!**
-
----
-
-*You're receiving this because you're part of our mailing list. We don't spam or sell your information. To unsubscribe, use the link below.*
-"""
+AUTHOR_CTA = ""
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +366,8 @@ INSTRUCTIONS
 5. Preserve all [IMAGE: ...] markers from the outline exactly as-is — do not remove them.
 6. Include the FAQ section and Conclusion from the outline.
 7. Target 2,500–3,500 words total.
-8. Open with a brief personal newsletter-style hook (2–3 sentences) before the H1.
-9. Bold key terms on first use.
-10. End with a strong call-to-action.
+8. Bold key terms on first use.
+9. End with a strong call-to-action.
 
 Write the full article now. Output the article content ONLY."""
 

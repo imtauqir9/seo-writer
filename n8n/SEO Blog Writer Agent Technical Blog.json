@@ -1418,7 +1418,7 @@
     },
     {
       "parameters": {
-        "sendTo": "hamza@traversaalai.com",
+        "sendTo": "imtauqir9@gmail.com",
         "subject": "New Blogs Generated",
         "emailType": "text",
         "message": "=Hello,\n\nYour new blog posts have been successfully generated.\nView On Sheet: https://docs.google.com/spreadsheets/d/1CmGw5xDrTTWevV-lgNEswdTFzUS7YjUNxBr2Ct_a2LQ/edit?gid=0#gid=0\n\nBest regards,\nYour SEO Blog Writer Agent",
