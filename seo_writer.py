@@ -72,11 +72,19 @@ client = anthropic.Anthropic()
 AUTHOR_INTRO_TEMPLATE = """\
 👋 Hi everyone, Imran here.
 Welcome to Edition #{edition} of a newsletter that people around the world actually look forward to reading.
-
----
 """
 
-AUTHOR_CTA = ""
+AUTHOR_CTA = """\
+
+---
+
+That's a wrap for this edition. If it gave you something useful, the best next step is to try one idea for real this week.
+
+**Let's connect.** I write about what I'm building and learning with AI agents on LinkedIn — come say hi 👉 [Imran Tauqir on LinkedIn](https://www.linkedin.com/in/imrantauqir/)
+
+Until next time,
+**Imran**
+"""
 
 
 # ---------------------------------------------------------------------------
