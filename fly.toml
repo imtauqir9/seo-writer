@@ -1,0 +1,31 @@
+# Fly.io config for the SEO Writer web app.
+# Change `app` to a globally-unique name and `primary_region` to one near you
+# (run `flyctl platform regions` to list them). See README-DEPLOY.md.
+
+app = "seo-writer-app"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Scale to zero when idle to save money; wakes on the next request.
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+  # 1 worker holds the in-memory job store, so keep a single machine.
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+# Persist generated articles across deploys/restarts.
+[[mounts]]
+  source = "seo_data"
+  destination = "/app/output"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

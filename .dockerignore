@@ -1,0 +1,30 @@
+# Secrets — set these as Fly secrets, never bake into the image
+.env
+*.env
+.env.local
+.env.example
+
+# Python cruft
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Generated articles — persisted via Fly volume, not the image
+output/
+
+# Version control & editor
+.git/
+.gitignore
+.vscode/
+.claude/
+*.swp
+
+# Not needed at runtime
+README.md
+n8n/
+sample-articles/
+word-humanizer/
+chapters/

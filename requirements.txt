@@ -1,2 +1,6 @@
 anthropic
 requests
+flask
+gunicorn
+markdown
+python-docx
