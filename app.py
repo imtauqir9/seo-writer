@@ -158,13 +158,19 @@ def api_start():
                 bufsize=1,
                 env={**os.environ},
             )
+            last_error = ""
             for line in proc.stdout:
-                q.put(("log", line.rstrip()))
+                line = line.rstrip()
+                # seo_writer.py prefixes fatal, already-human-readable failures
+                # with "ERROR:" — prefer that over a bare exit code.
+                if line.startswith("ERROR:"):
+                    last_error = line[len("ERROR:"):].strip()
+                q.put(("log", line))
             proc.wait()
             if proc.returncode == 0:
                 q.put(("done", ""))
             else:
-                q.put(("error", f"Pipeline exited with code {proc.returncode}"))
+                q.put(("error", last_error or f"Pipeline exited with code {proc.returncode}"))
         except Exception as e:
             q.put(("error", str(e)))
 

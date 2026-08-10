@@ -40,8 +40,12 @@ Return ONLY the rewritten paragraph. No explanation, no preamble.`;
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 1024,
+        model: 'claude-sonnet-5',
+        // Sonnet 5 thinks by default and thinking shares the max_tokens budget,
+        // so this cap is well above what the rewritten paragraph alone needs.
+        max_tokens: 8192,
+        thinking: { type: 'adaptive' },
+        output_config: { effort: 'low' },
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: text }],
       }),
@@ -53,7 +57,15 @@ Return ONLY the rewritten paragraph. No explanation, no preamble.`;
       return res.status(response.status).json({ error: data.error?.message || 'API error' });
     }
 
-    res.json({ result: data.content[0].text.trim() });
+    // With thinking enabled content[0] is a thinking block — find the text block.
+    const block = (data.content || []).find((b) => b.type === 'text');
+    if (!block || !block.text.trim()) {
+      return res.status(502).json({
+        error: `Claude returned no text (stop_reason: ${data.stop_reason}).`,
+      });
+    }
+
+    res.json({ result: block.text.trim() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

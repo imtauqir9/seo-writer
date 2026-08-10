@@ -59,7 +59,7 @@ _load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5"
 SERPAPI_BASE = "https://serpapi.com/search.json"
 UNSPLASH_BASE = "https://unsplash.com/s/photos"
 
@@ -98,13 +98,102 @@ def slugify(text: str) -> str:
     return text[:80]
 
 
-def call_claude(prompt: str, system: str = "", max_tokens: int = 8000) -> str:
+CONSOLE_LIMITS_URL = "https://console.anthropic.com/settings/limits"
+
+
+class ClaudeError(RuntimeError):
+    """An Anthropic API failure, already phrased for a human to read."""
+
+
+def _api_message(e: "anthropic.APIStatusError") -> str:
+    """The API's own error sentence.
+
+    Prefer the parsed body over e.message, which the SDK builds as
+    "Error code: 400 - {'type': 'error', ...}" — the whole payload repr.
+    """
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        message = (body.get("error") or {}).get("message")
+        if message:
+            return str(message)
+    return e.message
+
+
+def call_claude(prompt: str, system: str = "", max_tokens: int = 16000) -> str:
     messages = [{"role": "user", "content": prompt}]
-    kwargs = {"model": MODEL, "max_tokens": max_tokens, "messages": messages}
+    kwargs = {
+        "model": MODEL,
+        "max_tokens": max_tokens,
+        "messages": messages,
+        # Sonnet 5 runs adaptive thinking when `thinking` is omitted, so state it
+        # explicitly. Low effort keeps the token cost close to the old no-thinking
+        # behaviour while still buying Sonnet 5's better planning.
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "low"},
+    }
     if system:
         kwargs["system"] = system
-    response = client.messages.create(**kwargs)
-    return response.content[0].text.strip()
+    try:
+        response = client.messages.create(**kwargs)
+    except anthropic.BadRequestError as e:
+        # The spend cap set in the Console arrives as a 400, not a 429, and the
+        # SDK does not retry it — surface the reset date the API gives us.
+        message = _api_message(e)
+        if "usage limit" in message.lower():
+            raise ClaudeError(
+                f"Anthropic API usage limit reached. {message} "
+                f"Raise or remove the cap here: {CONSOLE_LIMITS_URL}"
+            ) from e
+        raise ClaudeError(f"Anthropic rejected the request: {message}") from e
+    except anthropic.AuthenticationError as e:
+        raise ClaudeError(
+            "Anthropic rejected the API key. Check that ANTHROPIC_API_KEY is set "
+            f"to a current, un-revoked key. ({_api_message(e)})"
+        ) from e
+    except anthropic.PermissionDeniedError as e:
+        detail = (
+            "This usually means the account is out of credits."
+            if e.type == "billing_error"
+            else f"The key may lack access to {MODEL}."
+        )
+        raise ClaudeError(
+            f"Anthropic denied the request. {detail} ({_api_message(e)})"
+        ) from e
+    except anthropic.RateLimitError as e:
+        # The SDK already retried this twice, so it is not a momentary spike.
+        raise ClaudeError(
+            f"Anthropic rate limit hit and retries were exhausted. Wait a minute "
+            f"and run again. ({_api_message(e)})"
+        ) from e
+    except anthropic.APIStatusError as e:
+        raise ClaudeError(
+            f"Anthropic returned an error (HTTP {e.status_code}): {_api_message(e)}"
+        ) from e
+    except anthropic.APIConnectionError as e:
+        raise ClaudeError(
+            f"Could not reach the Anthropic API. Check your network connection. ({e})"
+        ) from e
+
+    if response.stop_reason == "refusal":
+        raise ClaudeError(
+            "Claude declined to answer this prompt for safety reasons. "
+            "Try rephrasing the topic."
+        )
+
+    # With thinking enabled, content[0] is a thinking block — pick the text block
+    # out rather than indexing blindly.
+    text = next((b.text for b in response.content if b.type == "text"), None)
+
+    if text is None or not text.strip():
+        if response.stop_reason == "max_tokens":
+            raise ClaudeError(
+                f"Claude hit the {max_tokens}-token output cap before writing a "
+                f"response. Raise max_tokens for this step."
+            )
+        raise ClaudeError(
+            f"Claude returned no text (stop_reason: {response.stop_reason})."
+        )
+    return text.strip()
 
 
 def extract_json(text: str) -> dict:
@@ -143,7 +232,7 @@ Extract the single best search query (2–4 words) that:
 
 Return ONLY the search query string — no explanation, no quotes, no punctuation."""
 
-    return call_claude(prompt, max_tokens=50).strip().strip('"').strip("'")
+    return call_claude(prompt, max_tokens=2000).strip().strip('"').strip("'")
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +330,7 @@ Return ONLY valid JSON:
   "reasoning": "<brief explanation>"
 }}"""
 
-    response = call_claude(prompt, max_tokens=500)
+    response = call_claude(prompt, max_tokens=4000)
     result = extract_json(response)
     refined = result.get("revised_title", title)
     print(f"  New title: {refined}")
@@ -269,7 +358,7 @@ Article goal: {research.get("article_goal")}
 
 Write the takeaways as a concise bullet list (4–5 items). Each should be a clear, actionable insight a reader will gain. Start each with "- "."""
 
-    result = call_claude(prompt, max_tokens=600)
+    result = call_claude(prompt, max_tokens=4000)
     print(f"  Takeaways generated ({len(result.split(chr(10)))} lines).")
     return result
 
@@ -329,7 +418,7 @@ Produce a detailed markdown outline with:
 
 Format as clean markdown. Be specific — each section note should guide the writer clearly."""
 
-    result = call_claude(prompt, max_tokens=3000)
+    result = call_claude(prompt, max_tokens=8000)
     print(f"  Outline generated ({len(result.split(chr(10)))} lines).")
     return result
 
@@ -379,7 +468,7 @@ INSTRUCTIONS
 
 Write the full article now. Output the article content ONLY."""
 
-    result = call_claude(prompt, max_tokens=8000)
+    result = call_claude(prompt, max_tokens=16000)
     word_count = len(result.split())
     print(f"  Article written ({word_count} words).")
     return result
@@ -502,7 +591,7 @@ ARTICLE TO REWRITE:
 
 Return ONLY the rewritten article. No preamble, no commentary."""
 
-    draft = call_claude(prompt, max_tokens=8000)
+    draft = call_claude(prompt, max_tokens=16000)
     print(f"  Pass 1 complete ({len(draft.split())} words). Running self-audit...")
 
     # Pass 2: self-audit and final polish
@@ -529,7 +618,7 @@ FINAL ARTICLE:
 ARTICLE:
 {draft}"""
 
-    audit_result = call_claude(audit_prompt, max_tokens=8000)
+    audit_result = call_claude(audit_prompt, max_tokens=16000)
 
     # Extract the final article from the audit output
     if "FINAL ARTICLE:" in audit_result:
@@ -617,7 +706,7 @@ Return ONLY valid JSON:
   }}
 }}"""
 
-    response = call_claude(prompt, max_tokens=400)
+    response = call_claude(prompt, max_tokens=4000)
     result = extract_json(response)
     meta = result.get("seo_meta", {})
     desc = meta.get("description", "")
@@ -1074,7 +1163,13 @@ def main():
     keywords = args.keywords or ("" if intent else args.topic)
     output_dir = Path(args.output_dir)
 
-    run(title=args.topic, keywords=keywords, output_dir=output_dir, edition=args.edition, intent=intent)
+    try:
+        run(title=args.topic, keywords=keywords, output_dir=output_dir, edition=args.edition, intent=intent)
+    except ClaudeError as e:
+        # Flattened to one line so the web UI, which reads the log line by line,
+        # can surface the whole message as a single error.
+        print(f"ERROR: {' '.join(str(e).split())}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
