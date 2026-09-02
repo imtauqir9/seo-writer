@@ -1226,6 +1226,21 @@ order. Return at most 12 issues, most severe first."""
     report = extract_json(response)
 
     issues = report.get("issues", []) or []
+
+    # The loop that follows keys findings by id, so a finding the auditor left
+    # unnumbered - or numbered the same as an earlier one - would vanish before
+    # anyone argued about it. Give those a fresh id instead.
+    seen = set()
+    for issue in issues:
+        iid = issue.get("id")
+        if not iid or iid in seen:
+            n = 1
+            while f"x{n}" in seen:
+                n += 1
+            iid = f"x{n}"
+            issue["id"] = iid
+        seen.add(iid)
+
     scores = report.get("scores", {}) or {}
     if scores:
         print("  Scores: " + ", ".join(f"{k}={v}" for k, v in scores.items()))
