@@ -27,7 +27,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -61,31 +61,242 @@ _load_dotenv()
 
 MODEL = "claude-sonnet-5"
 
-# The verify/judge stage deliberately does not reuse MODEL at its default effort.
-# The auditor thinks harder than the writer did, and the judge is a different model
-# entirely, so a disagreement is not settled by the same weights that caused it.
-VERIFIER_MODEL = "claude-sonnet-5"
+# Three roles argue about the article: the writer produces it, the auditor attacks
+# it, the judge settles what they cannot. The point of the stage is decorrelated
+# error, so the roles are resolved onto the most distinct weights the available
+# keys allow, rather than being pinned to one vendor.
+#
+# The auditor matters more than the judge here. The judge only ever rules on
+# findings the auditor already raised, so a blind spot shared between writer and
+# auditor means the finding never exists to be argued about. Distinctness is
+# therefore spent on the auditor first.
+
+VERIFIER_MODEL = "claude-opus-5"    # Anthropic-side auditor: not the writer's weights
 VERIFIER_EFFORT = "high"
 JUDGE_MODEL = "claude-opus-5"
 JUDGE_EFFORT = "high"
 
-# The judge is the one role where a second vendor genuinely buys something: two
-# Anthropic models can share the blind spot that put the disputed sentence in the
-# article in the first place. Set OPENAI_API_KEY and the judge switches over.
-#   JUDGE_PROVIDER=auto      openai when OPENAI_API_KEY is set, else anthropic
-#   JUDGE_PROVIDER=anthropic force Claude
-#   JUDGE_PROVIDER=openai    force OpenAI (errors if the key is missing)
-JUDGE_PROVIDER = os.getenv("JUDGE_PROVIDER", "auto").strip().lower()
 OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-5.5")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+
+# Per-role vendor override. "auto" picks the most distinct vendor that has a key.
+#   auto | anthropic | openai | gemini
+AUDITOR_PROVIDER = os.getenv("AUDITOR_PROVIDER", "auto").strip().lower()
+JUDGE_PROVIDER = os.getenv("JUDGE_PROVIDER", "auto").strip().lower()
+
+_PROVIDER_KEYS = {
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+}
+
+
+def available_providers() -> list[str]:
+    """Vendors this machine actually holds a key for."""
+    return [p for p, env in _PROVIDER_KEYS.items() if os.getenv(env)]
+
+
+def _provider_model(provider: str, anthropic_model: str) -> str:
+    if provider == "openai":
+        return OPENAI_JUDGE_MODEL
+    if provider == "gemini":
+        return GEMINI_MODEL
+    return anthropic_model
+
+
+def resolve_agents() -> dict:
+    """Assign writer, auditor and judge to the most distinct vendors available.
+
+    The writer stays on Anthropic: the style prompts and sample-article matching
+    were tuned against it, and swapping it changes the product rather than
+    checking it. The other two are pushed off the writer's vendor, and off each
+    other's, whenever a key exists to do so.
+    """
+    have = available_providers()
+
+    def pick(override: str, avoid: list[list[str]], preference: list[str]) -> str:
+        """avoid is tiered: the first list is the ideal, later lists relax it."""
+        if override in _PROVIDER_KEYS:
+            return override                      # explicit wins, key checked at call time
+        for tier in avoid + [[]]:
+            for p in preference:
+                if p in have and p not in tier:
+                    return p
+        return "anthropic"
+
+    auditor = pick(AUDITOR_PROVIDER, avoid=[["anthropic"]],
+                   preference=["openai", "gemini", "anthropic"])
+    # With only two vendors the judge has to reuse one. Reusing the writer's
+    # vendor on a bigger model beats reusing the auditor's exact model, which
+    # would have the judge rubber-stamp the finding it just made.
+    judge = pick(JUDGE_PROVIDER, avoid=[["anthropic", auditor], [auditor]],
+                 preference=["gemini", "openai", "anthropic"])
+
+    return {
+        "writer": {"provider": "anthropic", "model": MODEL, "effort": "low"},
+        "auditor": {"provider": auditor,
+                    "model": _provider_model(auditor, VERIFIER_MODEL),
+                    "effort": VERIFIER_EFFORT},
+        "judge": {"provider": judge,
+                  "model": _provider_model(judge, JUDGE_MODEL),
+                  "effort": JUDGE_EFFORT},
+    }
+
+
+def describe_agents(agents: dict) -> str:
+    roles = " | ".join(f"{r}: {a['model']} ({a['provider']})" for r, a in agents.items())
+    vendors = {a["provider"] for a in agents.values()}
+    models = {a["model"] for a in agents.values()}
+    return f"{roles}\n  {len(models)} distinct models across {len(vendors)} vendor(s)"
 
 
 def judge_provider() -> str:
-    """Which vendor rules on disputes, after resolving 'auto'."""
-    if JUDGE_PROVIDER == "openai":
-        return "openai"
-    if JUDGE_PROVIDER == "anthropic":
-        return "anthropic"
-    return "openai" if os.getenv("OPENAI_API_KEY") else "anthropic"
+    """Which vendor rules on disputes, after resolving 'auto'. Kept for callers."""
+    return resolve_agents()["judge"]["provider"]
+
+# Publication identity. Used for the canonical URL, Open Graph tags and the
+# Article/Person schema. Without SITE_URL the canonical and og:url are omitted
+# rather than guessed - a wrong canonical is worse than none.
+SITE_URL = os.getenv("SITE_URL", "").rstrip("/")
+AUTHOR_NAME = os.getenv("AUTHOR_NAME", "Imran Tauqir")
+AUTHOR_URL = os.getenv("AUTHOR_URL", "https://imrantauqir.com/")
+
+# ---------------------------------------------------------------------------
+# Token accounting
+# ---------------------------------------------------------------------------
+#
+# A single article makes fifteen-plus calls across three vendors at two effort
+# levels, and until now nothing counted them. Tokens are taken from what each
+# API actually reports, never estimated. Cost is a second, softer layer: it is
+# only as right as the table below, so an unpriced model still gets its tokens
+# counted and simply reports no dollar figure rather than a wrong one.
+#
+# USD per million tokens, (input, output). The Anthropic rows are first-party
+# list prices. VERIFY the OpenAI and Gemini rows against your provider's own
+# pricing page before trusting the totals - override with MODEL_PRICES, a JSON
+# object of {"model": [input, output]}.
+MODEL_PRICES = {
+    "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+try:
+    MODEL_PRICES.update({k: tuple(v) for k, v in
+                         json.loads(os.getenv("MODEL_PRICES", "{}")).items()})
+except (ValueError, TypeError, AttributeError):
+    print("Warning: MODEL_PRICES is not valid JSON; using built-in prices.")
+
+# Anthropic bills a cache read at roughly a tenth of the input rate, and a cache
+# write at roughly 1.25x. Close enough to be useful, flagged as approximate.
+_CACHE_READ_MULTIPLIER = 0.10
+_CACHE_WRITE_MULTIPLIER = 1.25
+
+_USAGE_LOG: list[dict] = []
+_CURRENT_STEP = "startup"
+
+
+def _price(model: str, tokens_in: int, tokens_out: int,
+           cache_read: int = 0, cache_write: int = 0) -> float | None:
+    """Dollars for one call, or None when the model has no price on file."""
+    rates = MODEL_PRICES.get(model)
+    if not rates:
+        return None
+    rate_in, rate_out = rates
+    billable_in = tokens_in + cache_read * _CACHE_READ_MULTIPLIER \
+        + cache_write * _CACHE_WRITE_MULTIPLIER
+    return (billable_in * rate_in + tokens_out * rate_out) / 1_000_000
+
+
+def record_usage(provider: str, model: str, tokens_in: int, tokens_out: int,
+                 cache_read: int = 0, cache_write: int = 0):
+    """Append one call to the ledger. Called by every vendor wrapper."""
+    entry = {
+        "step": _CURRENT_STEP,
+        "provider": provider,
+        "model": model,
+        "input_tokens": int(tokens_in or 0),
+        "output_tokens": int(tokens_out or 0),
+        "cache_read_tokens": int(cache_read or 0),
+        "cache_write_tokens": int(cache_write or 0),
+        "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    entry["cost_usd"] = _price(model, entry["input_tokens"], entry["output_tokens"],
+                               entry["cache_read_tokens"], entry["cache_write_tokens"])
+    _USAGE_LOG.append(entry)
+
+
+def reset_usage():
+    _USAGE_LOG.clear()
+
+
+def usage_summary() -> dict:
+    """Totals overall, per model, and per pipeline step."""
+    def blank():
+        return {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cost_usd": 0.0, "priced": True}
+
+    total, by_model, by_step = blank(), {}, {}
+    for e in _USAGE_LOG:
+        for bucket in (total,
+                       by_model.setdefault(e["model"], blank()),
+                       by_step.setdefault(e["step"], blank())):
+            bucket["calls"] += 1
+            bucket["input_tokens"] += e["input_tokens"]
+            bucket["output_tokens"] += e["output_tokens"]
+            bucket["cache_read_tokens"] += e["cache_read_tokens"]
+            if e["cost_usd"] is None:
+                bucket["priced"] = False
+            else:
+                bucket["cost_usd"] += e["cost_usd"]
+
+    total["total_tokens"] = total["input_tokens"] + total["output_tokens"]
+    return {"total": total, "by_model": by_model, "by_step": by_step,
+            "calls": list(_USAGE_LOG)}
+
+
+def print_usage_summary(summary: dict | None = None):
+    summary = summary or usage_summary()
+    t = summary["total"]
+    if not t["calls"]:
+        return
+    print(f"\n  Tokens: {t['input_tokens']:,} in + {t['output_tokens']:,} out "
+          f"= {t['total_tokens']:,} across {t['calls']} calls")
+    for model, m in sorted(summary["by_model"].items(),
+                           key=lambda kv: -kv[1]["output_tokens"]):
+        cost = f"${m['cost_usd']:.3f}" if m["priced"] else "unpriced"
+        print(f"    {model:<20} {m['calls']:>3} calls  "
+              f"{m['input_tokens']:>8,} in  {m['output_tokens']:>7,} out  {cost}")
+    if t["priced"]:
+        print(f"  Estimated cost: ${t['cost_usd']:.2f}")
+    else:
+        print(f"  Estimated cost: ${t['cost_usd']:.2f} plus unpriced models "
+              f"(add them to MODEL_PRICES for a complete figure)")
+
+
+def write_usage(slug: str, output_dir: Path, title: str = "") -> Path:
+    """Save this run's ledger, and append one line to the rolling usage log."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary = usage_summary()
+    path = output_dir / f"{slug}_usage.json"
+    path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    t = summary["total"]
+    line = {
+        "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "slug": slug, "title": title,
+        "calls": t["calls"], "input_tokens": t["input_tokens"],
+        "output_tokens": t["output_tokens"], "total_tokens": t["total_tokens"],
+        "cost_usd": round(t["cost_usd"], 4), "fully_priced": t["priced"],
+        "by_model": {m: {"calls": v["calls"],
+                         "input_tokens": v["input_tokens"],
+                         "output_tokens": v["output_tokens"],
+                         "cost_usd": round(v["cost_usd"], 4)}
+                     for m, v in summary["by_model"].items()},
+    }
+    with open(output_dir / "usage.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps(line) + "\n")
+    return path
+
 
 SERPAPI_BASE = "https://serpapi.com/search.json"
 UNSPLASH_BASE = "https://unsplash.com/s/photos"
@@ -202,6 +413,13 @@ def call_claude(prompt: str, system: str = "", max_tokens: int = 16000,
             f"Could not reach the Anthropic API. Check your network connection. ({e})"
         ) from e
 
+    u = getattr(response, "usage", None)
+    if u is not None:
+        record_usage("anthropic", model,
+                     getattr(u, "input_tokens", 0), getattr(u, "output_tokens", 0),
+                     getattr(u, "cache_read_input_tokens", 0) or 0,
+                     getattr(u, "cache_creation_input_tokens", 0) or 0)
+
     if response.stop_reason == "refusal":
         raise ClaudeError(
             "Claude declined to answer this prompt for safety reasons. "
@@ -258,10 +476,87 @@ def call_openai(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
             f"(currently '{OPENAI_JUDGE_MODEL}'), or set JUDGE_PROVIDER=anthropic."
         ) from e
 
+    u = getattr(response, "usage", None)
+    if u is not None:
+        record_usage("openai", OPENAI_JUDGE_MODEL,
+                     getattr(u, "prompt_tokens", 0), getattr(u, "completion_tokens", 0))
+
     text = (response.choices[0].message.content or "").strip()
     if not text:
         raise ClaudeError(f"The OpenAI judge returned no text (model: {OPENAI_JUDGE_MODEL}).")
     return text
+
+
+def call_gemini(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
+    """Third-vendor call, used for the auditor or judge when a Gemini key is set."""
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        raise ClaudeError(
+            "A role is set to gemini but the google-genai package is not installed. "
+            "Run: pip install google-genai"
+        ) from e
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise ClaudeError(
+            "A role is set to gemini but GEMINI_API_KEY is not set. Add it to .env, "
+            "or set the role's provider to anthropic or openai."
+        )
+
+    config = {"max_output_tokens": max_tokens}
+    if system:
+        config["system_instruction"] = system
+
+    try:
+        response = genai.Client(api_key=os.getenv("GEMINI_API_KEY")).models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(**config),
+        )
+    except Exception as e:
+        raise ClaudeError(
+            f"The Gemini call failed ({type(e).__name__}: {e}). If the model name is "
+            f"wrong, set GEMINI_MODEL to one your key can reach (currently "
+            f"'{GEMINI_MODEL}'), or set the role's provider to anthropic."
+        ) from e
+
+    u = getattr(response, "usage_metadata", None)
+    if u is not None:
+        record_usage("gemini", GEMINI_MODEL,
+                     getattr(u, "prompt_token_count", 0) or 0,
+                     getattr(u, "candidates_token_count", 0) or 0,
+                     getattr(u, "cached_content_token_count", 0) or 0)
+
+    text = (getattr(response, "text", "") or "").strip()
+    if not text:
+        raise ClaudeError(f"Gemini returned no text (model: {GEMINI_MODEL}).")
+    return text
+
+
+def call_agent(role: dict, prompt: str, system: str = "", max_tokens: int = 4000,
+               agents: dict | None = None) -> str:
+    """Run one role on its assigned vendor, falling back to Claude if that vendor is down.
+
+    A vendor outage must not destroy an article that already cost a dozen calls,
+    so the fallback is unconditional - but it is announced, because an article
+    audited by the writer's own family is a weaker article than the roster claims.
+    """
+    provider = role["provider"]
+
+    if provider != "anthropic":
+        caller = call_openai if provider == "openai" else call_gemini
+        try:
+            return caller(prompt, system=system, max_tokens=max_tokens)
+        except ClaudeError as e:
+            reason = " ".join(str(e).split())[:160]
+            print(f"  {provider} unavailable, falling back to {JUDGE_MODEL}.")
+            print(f"    {reason}")
+            return call_claude(prompt, system=system, max_tokens=max_tokens,
+                               model=JUDGE_MODEL, effort=role.get("effort", "high"))
+
+    return call_claude(prompt, system=system, max_tokens=max_tokens,
+                       model=role["model"], effort=role.get("effort", "high"))
 
 
 def extract_json(text: str) -> dict:
@@ -273,6 +568,10 @@ def extract_json(text: str) -> dict:
 
 
 def log(step: str, msg: str = ""):
+    # The ledger attributes each call to whichever step was last announced, so
+    # the dashboard can say which stage of the pipeline spent the tokens.
+    global _CURRENT_STEP
+    _CURRENT_STEP = step
     print(f"\n[{step}] {msg}" if msg else f"\n[{step}]", flush=True)
 
 
@@ -480,9 +779,15 @@ Produce a detailed markdown outline with:
 4. For each section: brief description of what to cover (1–2 sentences)
 5. 6–8 image placement markers formatted as:
    [IMAGE: <descriptive alt text> | Query: <google image search query>]
-6. A FAQ section (4–5 questions)
-7. Conclusion section (150–200 words with CTA)
-8. Supplementary metadata block at the end:
+6. At least one comparison table, placed in whichever section it genuinely belongs
+   to. Note its columns in the outline. Tables are the passage an answer engine is
+   most likely to quote whole, so give it real rows: prices, versions, tradeoffs,
+   or a this-vs-that. Do not invent a table where the topic has nothing to compare.
+7. A FAQ section with 4–5 questions. Each MUST be an H3 phrased as a real question
+   ending in a question mark, and each answer must stand on its own without the
+   surrounding page - they are extracted into FAQPage structured data.
+8. Conclusion section (150–200 words with CTA)
+9. Supplementary metadata block at the end:
    - URL slug suggestion
    - 5–7 internal linking opportunities
    - Keyword density targets
@@ -532,7 +837,11 @@ INSTRUCTIONS
 3. Integrate keywords naturally — no stuffing.
 4. Cite sources inline where relevant: "Source: https://..."
 5. Preserve all [IMAGE: ...] markers from the outline exactly as-is — do not remove them.
-6. Include the FAQ section and Conclusion from the outline.
+6. Include the FAQ section and Conclusion from the outline. Every FAQ question must
+   be an H3 ending in a question mark, and its answer must make sense quoted on its
+   own - those pairs become FAQPage structured data.
+7. Build any comparison table the outline calls for as a real markdown table with a
+   header row. It is the passage most likely to be quoted whole by an answer engine.
 7. Target 2,500–3,500 words total.
 8. Bold key terms on first use.
 9. End with a strong call-to-action.
@@ -706,9 +1015,63 @@ ARTICLE:
 
     final = _strip_em_dashes(final)
 
+    # Pass 3: repair the tells a scanner can name, rather than asking again in general.
+    scan = scan_ai_tells(final)
+    print_tell_scan(scan, "Scan after pass 2")
+
+    uniform = scan["sentence_count"] > 4 and scan["sentence_cv"] < 0.45
+    if scan["total"] or uniform:
+        log("STEP 6", "Humanizing content (pass 3 - targeted repair)")
+        repaired = _strip_em_dashes(repair_ai_tells(final, scan))
+        after = scan_ai_tells(repaired)
+        print_tell_scan(after, "Scan after pass 3")
+        # A repair pass that made the article worse is not a repair. Keep pass 2.
+        if after["total"] > scan["total"]:
+            print(f"  Pass 3 raised the count {scan['total']} -> {after['total']}; "
+                  f"keeping the pass 2 text.")
+        else:
+            print(f"  Pass 3 removed {scan['total'] - after['total']} tell(s).")
+            final = repaired
+    else:
+        print("  Scanner found nothing to repair.")
+
     word_count = len(final.split())
     print(f"  Humanized ({word_count} words).")
     return final
+
+
+def repair_ai_tells(article: str, scan: dict) -> str:
+    """Rewrite only the phrases the scanner named. Everything else stays put."""
+    report = format_tell_report(scan)
+
+    prompt = f"""A scanner found these AI tells in your article. Fix each one where it is
+genuinely a tell, and leave it alone where the word is doing real work.
+
+WHAT THE SCANNER FOUND
+{report}
+
+These are candidates, not verdicts. A scanner cannot read context: "key" in "API key" is
+correct, a heading of proper nouns is not title case, and a technical term with no plain
+synonym should stay. Judge each one, then fix the genuine ones.
+
+STRUCTURAL CONSTRAINTS (never break these):
+- Preserve ALL markdown headings unless the finding is that a heading is title-cased,
+  in which case change only its capitalisation
+- Preserve ALL [IMAGE: alt text | Query: ...] markers exactly
+- Preserve ALL "Source: ..." citations exactly
+- Do NOT add new factual claims, and do NOT remove sections
+- Do NOT rewrite sentences that contain none of the phrases above, except where the
+  finding is that sentence length is too uniform
+
+If the scanner reported uniform sentence length, vary it for real: cut some sentences to
+under eight words, let others run long. Do not simply split every sentence in half.
+
+ARTICLE
+{article}
+
+Return ONLY the revised article. No preamble, no list of what you changed."""
+
+    return call_claude(prompt, max_tokens=16000)
 
 
 def _strip_em_dashes(text: str) -> str:
@@ -717,19 +1080,28 @@ def _strip_em_dashes(text: str) -> str:
     Rules:
       " — "  (spaced em dash mid-sentence)  → ", "
       "—"    (tight em dash, e.g. compound) → "-"
-    Skips lines that are markdown headings, image markers, or source citations
-    so structural content is never mangled.
+    Headings get their own rule. A comma reads wrong in a heading, so a spaced em
+    dash there becomes a colon, or a hyphen when the heading already has one. This
+    used to skip headings entirely, which is why every shipped article still had
+    nine to thirteen em dashes in its section titles - the exact tell the verifier
+    is told to look for.
+    Image markers and source citations are still skipped: those are structural
+    strings the rest of the pipeline matches on, not prose.
     """
     lines = text.split("\n")
     result = []
     for line in lines:
-        # Leave headings, image markers, source lines, and HR lines untouched
         stripped = line.lstrip()
-        if (stripped.startswith("#")
-                or stripped.startswith("[IMAGE:")
+        if (stripped.startswith("[IMAGE:")
                 or stripped.startswith("*Source:")
                 or stripped.startswith("Source:")
                 or stripped == "---"):
+            result.append(line)
+            continue
+        if stripped.startswith("#"):
+            if "—" in line:
+                sep = " - " if ":" in line else ": "
+                line = line.replace(" — ", sep).replace("—", "-")
             result.append(line)
             continue
         # Spaced em dash → comma (most common inline use)
@@ -742,6 +1114,201 @@ def _strip_em_dashes(text: str) -> str:
     if removed:
         print(f"  Em dashes removed/replaced: {removed}")
     return "\n".join(result)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic AI-tell scanner
+# ---------------------------------------------------------------------------
+#
+# The self-audit in step 6 asks a model whether its own draft still reads as AI.
+# That is the same judgment that produced the tells in the first place, and it
+# has no way to be wrong out loud. This scanner is the boring counterweight: it
+# holds no opinion, it counts. What it finds goes back to the model as an exact
+# phrase list, so the repair pass fixes named strings instead of trying harder
+# in general.
+#
+# These lists mirror the numbered items in _HUMANIZER_PATTERNS. Keep them in step.
+
+_TELL_VOCAB = (
+    # 7 - AI vocabulary
+    "additionally", "crucial", "delve", "delves", "delving", "emphasizing",
+    "enduring", "enhance", "enhances", "enhancing", "fostering", "garner",
+    "interplay", "intricate", "intricacies", "pivotal", "showcase", "showcases",
+    "showcasing", "tapestry", "testament", "underscore", "underscores",
+    "underscoring", "vibrant", "boasts", "nestled", "renowned", "groundbreaking",
+    "breathtaking", "myriad", "realm", "seamless", "seamlessly", "robust",
+    "leverage", "leveraging", "navigate", "navigating", "unlock", "unlocking",
+    "harness", "harnessing", "elevate", "profound", "paramount", "meticulous",
+    "meticulously", "bustling", "captivating", "unwavering", "transformative",
+)
+
+_TELL_PHRASES = (
+    # 1 - significance inflation
+    "stands as", "serves as a testament", "pivotal moment", "evolving landscape",
+    "setting the stage for", "indelible mark", "deeply rooted", "plays a vital role",
+    "plays a crucial role", "in today's world", "in the world of",
+    # 5 - vague attribution
+    "experts say", "experts argue", "industry reports", "some critics say",
+    "observers note", "studies show", "research suggests", "it is widely",
+    # 6 / 24 - formulaic frames and conclusions
+    "despite these challenges", "the future looks bright", "exciting times",
+    "a step in the right direction", "only time will tell", "one thing is clear",
+    "when it comes to", "at the end of the day",
+    # 9 - negative parallelism
+    "not only", "it's not just about", "it is not just about",
+    # 19 / 21 / 22 - chatbot artifacts, sycophancy, filler
+    "great question", "i hope this helps", "let me know if", "here is a",
+    "you're absolutely right", "that's an excellent point",
+    "it is important to note", "it's important to note", "in order to",
+    "due to the fact that", "at this point in time", "has the ability to",
+    "it is worth noting", "needless to say",
+    # 20 - knowledge-cutoff disclaimers
+    "as of my last update", "while specific details are limited",
+)
+
+# Words that stay lowercase in sentence case, so a heading full of them is not
+# evidence of title casing.
+_HEADING_STOPWORDS = {
+    "a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "of",
+    "on", "or", "the", "to", "vs", "with", "over", "via", "per",
+}
+
+
+def _scannable_lines(text: str) -> list[str]:
+    """Body prose only. Citations, image markers and code are not the writer's voice."""
+    lines, in_code = [], False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if (stripped.startswith("[IMAGE:")
+                or stripped.startswith("Source:")
+                or stripped.startswith("*Source:")
+                or stripped.startswith("> Source:")):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _is_title_case(heading: str) -> bool:
+    words = re.findall(r"[A-Za-z][A-Za-z'’-]*", heading)
+    if len(words) < 3:
+        return False
+    # The first word is capitalised in both conventions, so it proves nothing.
+    rest = [w for w in words[1:] if w.lower() not in _HEADING_STOPWORDS]
+    if len(rest) < 2:
+        return False
+    capped = sum(1 for w in rest if w[0].isupper())
+    return capped / len(rest) >= 0.7
+
+
+def _sentence_lengths(lines: list[str]) -> list[int]:
+    """Word counts per sentence, skipping headings, bullets and blank lines."""
+    prose = [l for l in lines
+             if l.strip() and not l.lstrip().startswith(("#", "-", "*", "|", ">"))]
+    lengths = []
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(prose)):
+        n = len(sentence.split())
+        if n:
+            lengths.append(n)
+    return lengths
+
+
+def scan_ai_tells(text: str) -> dict:
+    """Count concrete AI tells. No model call, no judgment - just occurrences."""
+    lines = _scannable_lines(text)
+    body = "\n".join(lines)
+    low = body.lower()
+
+    hits = []
+
+    for word in _TELL_VOCAB:
+        n = len(re.findall(rf"\b{re.escape(word)}\b", low))
+        if n:
+            hits.append({"kind": "vocab", "phrase": word, "count": n})
+
+    for phrase in _TELL_PHRASES:
+        n = low.count(phrase)
+        if n:
+            hits.append({"kind": "phrase", "phrase": phrase, "count": n})
+
+    structural = []
+    title_cased = [l.strip() for l in lines
+                   if l.lstrip().startswith("#") and _is_title_case(l.lstrip("# ").strip())]
+    if title_cased:
+        structural.append({"kind": "title_case_heading", "count": len(title_cased),
+                           "examples": title_cased[:5]})
+
+    inline_headers = [l.strip() for l in lines
+                      if re.match(r"\s*[-*]\s+\*\*[^*]+:\*\*", l)]
+    if inline_headers:
+        structural.append({"kind": "inline_header_bullet", "count": len(inline_headers),
+                           "examples": inline_headers[:5]})
+
+    em_dashes = body.count("—")
+    if em_dashes:
+        structural.append({"kind": "em_dash", "count": em_dashes, "examples": []})
+
+    emoji_headings = [l.strip() for l in lines
+                      if l.lstrip().startswith("#")
+                      and re.search(r"[\U0001F300-\U0001FAFF☀-➿]", l)]
+    if emoji_headings:
+        structural.append({"kind": "emoji_heading", "count": len(emoji_headings),
+                           "examples": emoji_headings[:5]})
+
+    # Uniform sentence length is the tell no wordlist catches. Human prose varies;
+    # generated prose clusters around one comfortable length.
+    lengths = _sentence_lengths(lines)
+    cv = 0.0
+    if len(lengths) > 4:
+        mean = sum(lengths) / len(lengths)
+        if mean:
+            var = sum((n - mean) ** 2 for n in lengths) / len(lengths)
+            cv = (var ** 0.5) / mean
+
+    words = max(len(body.split()), 1)
+    total = sum(h["count"] for h in hits) + sum(s["count"] for s in structural)
+
+    return {
+        "hits": sorted(hits, key=lambda h: -h["count"]),
+        "structural": structural,
+        "sentence_cv": round(cv, 3),
+        "sentence_count": len(lengths),
+        "words": words,
+        "total": total,
+        "per_1k": round(total / words * 1000, 2),
+    }
+
+
+def format_tell_report(scan: dict) -> str:
+    """The scan as a phrase list a model can act on, most frequent first."""
+    parts = []
+    for h in scan["hits"][:40]:
+        parts.append(f'- "{h["phrase"]}" x{h["count"]}')
+    for s in scan["structural"]:
+        line = f'- {s["kind"].replace("_", " ")} x{s["count"]}'
+        for ex in s.get("examples", [])[:3]:
+            line += f'\n    e.g. {ex[:90]}'
+        parts.append(line)
+    if scan["sentence_count"] > 4 and scan["sentence_cv"] < 0.45:
+        parts.append(
+            f'- sentence length is too uniform (variation {scan["sentence_cv"]}, '
+            f'want 0.45+ across {scan["sentence_count"]} sentences)'
+        )
+    return "\n".join(parts)
+
+
+def print_tell_scan(scan: dict, label: str):
+    top = ", ".join(f'{h["phrase"]}x{h["count"]}' for h in scan["hits"][:6])
+    print(f"  {label}: {scan['total']} tells ({scan['per_1k']}/1k words), "
+          f"sentence variation {scan['sentence_cv']}")
+    if top:
+        print(f"    most frequent: {top}")
+    for s in scan["structural"]:
+        print(f"    {s['kind'].replace('_', ' ')}: {s['count']}")
 
 
 # ---------------------------------------------------------------------------
@@ -901,14 +1468,205 @@ def extract_sources(article: str) -> list[str]:
     return result
 
 
-def build_sources_section(article: str) -> str:
+# Domains whose display name is not just the second-level label capitalised.
+_PUBLISHER_NAMES = {
+    "arxiv.org": "arXiv", "nytimes.com": "The New York Times", "wsj.com": "The Wall Street Journal",
+    "ft.com": "Financial Times", "bbc.co.uk": "BBC", "bbc.com": "BBC", "theverge.com": "The Verge",
+    "techcrunch.com": "TechCrunch", "arstechnica.com": "Ars Technica", "github.com": "GitHub",
+    "openai.com": "OpenAI", "anthropic.com": "Anthropic", "nvidia.com": "NVIDIA",
+    "developer.nvidia.com": "NVIDIA Developer", "aws.amazon.com": "AWS", "cloud.google.com":
+    "Google Cloud", "learn.microsoft.com": "Microsoft Learn", "en.wikipedia.org": "Wikipedia",
+    "huggingface.co": "Hugging Face", "stackoverflow.com": "Stack Overflow",
+}
+
+
+def publisher_name(url: str) -> str:
+    """A human name for the site behind a URL, for citations that read as citations."""
+    host = re.sub(r"^https?://", "", url).split("/")[0].lower().lstrip("www.")
+    if host in _PUBLISHER_NAMES:
+        return _PUBLISHER_NAMES[host]
+    for domain, name in _PUBLISHER_NAMES.items():
+        if host.endswith("." + domain):
+            return name
+    label = host.split(".")[0] if host.count(".") <= 1 else host.split(".")[-2]
+    if not label:
+        return host
+    # A three-letter domain is nearly always an acronym: idc, ibm, bbc, acm.
+    if len(label) <= 3 and label.isalpha():
+        return label.upper()
+    return label.replace("-", " ").title()
+
+
+def build_sources_section(article: str, accessed: str = "") -> str:
+    """Sources as named, dated citations.
+
+    A bare list of naked URLs is worth far less than the same list with a
+    publisher and a date on it: answer engines weight attributable citations,
+    and a reader cannot judge a link they cannot identify without clicking it.
+    """
     urls = extract_sources(article)
     if not urls:
         return ""
+    accessed = accessed or datetime.now().strftime("%B %d, %Y")
     lines = ["", "---", "", "## Sources", ""]
     for i, url in enumerate(urls, 1):
-        lines.append(f"{i}. {url}")
+        lines.append(f"{i}. {publisher_name(url)} — [{url}]({url}) (accessed {accessed})")
     return "\n".join(lines) + "\n"
+
+
+def parse_faq(article: str) -> list[dict]:
+    """Pull question/answer pairs out of the article's FAQ section.
+
+    Only the FAQ section, and only headings that are actually questions - a
+    FAQPage schema containing things that are not questions is worse than none.
+    """
+    lines = article.split("\n")
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"^#{2,3}\s", line) and (
+                "faq" in line.lower() or "frequently asked" in line.lower()):
+            start = i + 1
+            break
+    if start is None:
+        return []
+
+    def clean(q: str) -> str:
+        # Articles often label questions "Q: ...". The label is presentation;
+        # a FAQPage question name that starts with "Q:" reads as malformed data.
+        return re.sub(r"^\s*(Q\s*[:.\-]|Question\s*[:.\-])\s*", "", q).strip()
+
+    faqs, question, answer = [], None, []
+    for line in lines[start:]:
+        heading = re.match(r"^(#{2,4})\s+(.*)", line)
+        if heading:
+            level, text = len(heading.group(1)), heading.group(2).strip()
+            if question and answer:
+                faqs.append({"question": question, "answer": " ".join(answer).strip()})
+            question, answer = None, []
+            if level <= 2:
+                break                     # left the FAQ section
+            if text.endswith("?"):
+                question = clean(text)
+            continue
+        bold_q = re.match(r"^\*\*(.+\?)\*\*\s*$", line.strip())
+        if bold_q:
+            if question and answer:
+                faqs.append({"question": question, "answer": " ".join(answer).strip()})
+            question, answer = clean(bold_q.group(1)), []
+            continue
+        if question and line.strip() and not line.strip().startswith(("[IMAGE:", "Source:", "!")):
+            answer.append(line.strip())
+
+    if question and answer:
+        faqs.append({"question": question, "answer": " ".join(answer).strip()})
+    return [f for f in faqs if f["answer"]]
+
+
+def build_jsonld(slug: str, article: str, meta: dict, images: dict,
+                 generated_at: str) -> str:
+    """Article + FAQPage structured data.
+
+    Everything here is already computed elsewhere in the pipeline and was
+    previously written only to _meta.json, where no crawler will ever see it.
+    """
+    seo_title = meta.get("title") or ""
+    description = meta.get("description") or ""
+    canonical = f"{SITE_URL}/{slug}" if SITE_URL else ""
+
+    article_node = {
+        "@type": "Article",
+        "headline": seo_title[:110],          # schema.org caps headline at 110 chars
+        "description": description,
+        "datePublished": generated_at,
+        "dateModified": generated_at,
+        "author": {"@type": "Person", "name": AUTHOR_NAME, "url": AUTHOR_URL},
+        "publisher": {"@type": "Person", "name": AUTHOR_NAME, "url": AUTHOR_URL},
+        "inLanguage": "en",
+        "wordCount": len(article.split()),
+    }
+    if canonical:
+        article_node["url"] = canonical
+        article_node["mainEntityOfPage"] = {"@type": "WebPage", "@id": canonical}
+    image_urls = [v["url"] for v in images.values() if v.get("url")]
+    if image_urls:
+        article_node["image"] = image_urls[:6]
+    citations = extract_sources(article)
+    if citations:
+        article_node["citation"] = [
+            {"@type": "CreativeWork", "name": publisher_name(u), "url": u}
+            for u in citations[:20]
+        ]
+
+    graph = [article_node]
+
+    faqs = parse_faq(article)
+    if faqs:
+        graph.append({
+            "@type": "FAQPage",
+            "mainEntity": [
+                {"@type": "Question", "name": f["question"],
+                 "acceptedAnswer": {"@type": "Answer", "text": f["answer"]}}
+                for f in faqs
+            ],
+        })
+
+    payload = {"@context": "https://schema.org", "@graph": graph}
+    # </script> inside a JSON string would close the tag early.
+    return json.dumps(payload, indent=2, ensure_ascii=False).replace("</", "<\\/")
+
+
+def generate_answer_block(title: str, article: str, research: dict) -> str:
+    """A short, extractable answer placed directly under the H1.
+
+    Answer engines quote the first self-contained passage that answers the
+    query. Key takeaways are bullets about the article; this is an answer to the
+    question, written to survive being lifted out of the page on its own.
+    """
+    log("STEP 6.4", "Writing the direct-answer block")
+
+    kw = research.get("keywords", {})
+    prompt = f"""Write the short answer that belongs directly under this article's title.
+
+THE QUESTION A READER IS ASKING
+{kw.get("primary_keyword", title)}
+
+RULES
+- 40 to 60 words. Not a word more.
+- Answer the question in the first sentence. No preamble, no "in this article".
+- Lead with a definition or a direct claim: "X is ...", "X costs ...", "Yes, because ...".
+- Include the single most useful specific: a number, a price, a version, a timeframe.
+- It must make complete sense quoted on its own, with no surrounding page.
+- Plain sentences. No bullets, no heading, no bold, no em dashes.
+- Claim nothing the article does not already support.
+
+THE ARTICLE
+{article[:6000]}
+
+Return ONLY the answer paragraph."""
+
+    answer = _strip_em_dashes(call_claude(prompt, max_tokens=600).strip())
+    words = len(answer.split())
+    print(f"  Answer block: {words} words")
+    if words > 90:
+        print("  Answer block came back too long; skipping it rather than "
+              "burying the intro.")
+        return ""
+    return answer
+
+
+def insert_answer_block(article: str, answer: str) -> str:
+    """Put the answer immediately after the H1, before anything else."""
+    if not answer:
+        return article
+    lines = article.split("\n")
+    for i, line in enumerate(lines):
+        if line.startswith("# "):
+            rest = lines[i + 1:]
+            # Skip blank lines so the block lands tight against the title.
+            while rest and not rest[0].strip():
+                rest.pop(0)
+            return "\n".join(lines[:i + 1] + ["", answer, ""] + rest)
+    return answer + "\n\n" + article
 
 
 def wrap_with_branding(article: str, edition: int) -> str:
@@ -929,9 +1687,17 @@ def write_outputs(slug: str, article: str, meta: dict, images: dict, output_dir:
     print(f"\n  Article saved: {md_path}")
 
     # Meta JSON
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    faqs = parse_faq(branded)
     meta_payload = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": generated_at,
         "seo_meta": meta,
+        "canonical": f"{SITE_URL}/{slug}" if SITE_URL else None,
+        "author": {"name": AUTHOR_NAME, "url": AUTHOR_URL},
+        "faq_count": len(faqs),
+        "sources": [
+            {"publisher": publisher_name(u), "url": u} for u in extract_sources(branded)
+        ],
         "images": [
             {"alt": v["alt"], "url": v["url"], "source": v["source"]}
             for v in images.values()
@@ -942,8 +1708,12 @@ def write_outputs(slug: str, article: str, meta: dict, images: dict, output_dir:
     print(f"  Meta JSON saved: {meta_path}")
 
     # HTML export
-    html_path = _write_html(slug, branded, output_dir)
+    html_path = _write_html(slug, branded, output_dir, meta=meta, images=images,
+                            generated_at=generated_at)
     print(f"  HTML saved:     {html_path}")
+    print(f"  Structured data: Article"
+          + (f" + FAQPage ({len(faqs)} questions)" if faqs else " (no FAQ found)")
+          + ("" if SITE_URL else ", no canonical (set SITE_URL)"))
 
     # DOCX export
     docx_path = _write_docx(slug, branded, output_dir)
@@ -961,7 +1731,14 @@ def _linkify(text: str) -> str:
     )
 
 
-def _write_html(slug: str, branded: str, output_dir: Path) -> Path:
+def _esc(text: str) -> str:
+    """Escape a value going into an HTML attribute."""
+    return (str(text).replace("&", "&amp;").replace('"', "&quot;")
+            .replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _write_html(slug: str, branded: str, output_dir: Path, meta: dict | None = None,
+                images: dict | None = None, generated_at: str = "") -> Path:
     try:
         import markdown as md_lib
     except ImportError:
@@ -987,8 +1764,48 @@ def _write_html(slug: str, branded: str, output_dir: Path) -> Path:
     html_body = md_lib.markdown(src_patched, extensions=['tables', 'fenced_code'])
     html_body = _linkify(html_body)
 
+    canonical = f"{SITE_URL}/{slug}" if SITE_URL else ""
+    seo_title = (meta or {}).get("title") or slug.replace("-", " ").title()
+    description = (meta or {}).get("description") or ""
+    og_image = next((v["url"] for v in (images or {}).values() if v.get("url")), "")
+
+    head = [
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{_esc(seo_title)}</title>",
+    ]
+    if description:
+        head.append(f'<meta name="description" content="{_esc(description)}">')
+    head.append(f'<meta name="author" content="{_esc(AUTHOR_NAME)}">')
+    if canonical:
+        head.append(f'<link rel="canonical" href="{_esc(canonical)}">')
+    head += [
+        '<meta property="og:type" content="article">',
+        f'<meta property="og:title" content="{_esc(seo_title)}">',
+    ]
+    if description:
+        head.append(f'<meta property="og:description" content="{_esc(description)}">')
+    if canonical:
+        head.append(f'<meta property="og:url" content="{_esc(canonical)}">')
+    if og_image:
+        head.append(f'<meta property="og:image" content="{_esc(og_image)}">')
+    if generated_at:
+        head.append(f'<meta property="article:published_time" content="{_esc(generated_at)}">')
+    head.append(f'<meta property="article:author" content="{_esc(AUTHOR_NAME)}">')
+    head.append('<meta name="twitter:card" content="summary_large_image">')
+    head.append(f'<meta name="twitter:title" content="{_esc(seo_title)}">')
+    if description:
+        head.append(f'<meta name="twitter:description" content="{_esc(description)}">')
+    if og_image:
+        head.append(f'<meta name="twitter:image" content="{_esc(og_image)}">')
+
+    jsonld = build_jsonld(slug, branded, meta or {}, images or {}, generated_at)
+    head.append(f'<script type="application/ld+json">\n{jsonld}\n</script>')
+    head_html = "\n".join(head)
+
     full_html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
+<html lang="en"><head>
+{head_html}
 <style>
   body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.7; color: #222; }}
   h1,h2,h3 {{ color: #111; }}
@@ -1153,9 +1970,12 @@ JUDGE_SYSTEM = (
 
 
 def verify_content(article: str, outline: str, key_takeaways: str, research: dict,
-                   round_no: int = 1) -> dict:
+                   round_no: int = 1, agents: dict | None = None) -> dict:
     """Independent audit of the finished article. Returns {verdict, scores, issues}."""
-    log("STEP 6.5", f"Verification pass (round {round_no})")
+    agents = agents or resolve_agents()
+    auditor = agents["auditor"]
+    log("STEP 6.5", f"Verification pass (round {round_no}) "
+                    f"- auditor {auditor['model']} ({auditor['provider']})")
 
     kw = research.get("keywords", {})
     serp_context = research.get("serp_context") or "(no live SERP data was available)"
@@ -1221,8 +2041,7 @@ Return ONLY valid JSON in exactly this shape:
 Use "pass" only when there is nothing above low severity. Number the ids i1, i2, i3 in
 order. Return at most 12 issues, most severe first."""
 
-    response = call_claude(prompt, system=VERIFY_SYSTEM, max_tokens=8000,
-                           model=VERIFIER_MODEL, effort=VERIFIER_EFFORT)
+    response = call_agent(auditor, prompt, system=VERIFY_SYSTEM, max_tokens=8000)
     report = extract_json(response)
 
     issues = report.get("issues", []) or []
@@ -1304,11 +2123,12 @@ Include exactly one response per finding id."""
     return result
 
 
-def judge_disputes(article: str, disputes: list) -> dict:
+def judge_disputes(article: str, disputes: list, agents: dict | None = None) -> dict:
     """Settle contested findings with a third model. Returns {rulings: [...]}."""
-    provider = judge_provider()
-    judge_name = OPENAI_JUDGE_MODEL if provider == "openai" else JUDGE_MODEL
-    log("STEP 6.5", f"Escalating {len(disputes)} dispute(s) to judge ({judge_name})")
+    agents = agents or resolve_agents()
+    judge = agents["judge"]
+    log("STEP 6.5", f"Escalating {len(disputes)} dispute(s) to judge "
+                    f"({judge['model']} / {judge['provider']})")
 
     case_block = json.dumps(disputes, indent=2)
 
@@ -1338,20 +2158,9 @@ Return ONLY valid JSON:
 
 Include exactly one ruling per contested finding."""
 
-    response = None
-    if provider == "openai":
-        try:
-            response = call_openai(prompt, system=JUDGE_SYSTEM, max_tokens=4000)
-        except ClaudeError as e:
-            # A judge outage must not destroy an article that already cost a dozen
-            # calls to produce. Fall back to the Claude judge and keep going.
-            reason = " ".join(str(e).split())[:160]
-            print(f"  OpenAI judge unavailable, falling back to {JUDGE_MODEL}.")
-            print(f"    {reason}")
-
-    if response is None:
-        response = call_claude(prompt, system=JUDGE_SYSTEM, max_tokens=4000,
-                               model=JUDGE_MODEL, effort=JUDGE_EFFORT)
+    # call_agent carries the fallback: a judge outage must not destroy an article
+    # that already cost a dozen calls to produce.
+    response = call_agent(judge, prompt, system=JUDGE_SYSTEM, max_tokens=4000)
     result = extract_json(response)
 
     for r in result.get("rulings", []) or []:
@@ -1397,22 +2206,53 @@ Return ONLY the revised article. No preamble, no list of what you changed."""
 
 
 def verification_loop(article: str, outline: str, key_takeaways: str, research: dict,
-                      max_rounds: int = 2) -> str:
-    """Audit, argue, judge, fix - up to max_rounds times or until the audit passes."""
+                      max_rounds: int = 2, record: dict | None = None) -> str:
+    """Audit, argue, judge, fix - up to max_rounds times or until the audit passes.
+
+    Pass a dict as `record` to keep the argument itself. Everything the three
+    agents say is otherwise printed once and lost, which leaves you with a
+    changed article and no way to see who changed it or why.
+    """
+    # Resolve the roster once so every round is argued by the same three agents.
+    agents = resolve_agents()
+    log("STEP 6.5", "Agents\n  " + describe_agents(agents))
+    if len({a["provider"] for a in agents.values()}) == 1:
+        print("  Warning: all three roles are on one vendor. The audit is weaker "
+              "than it looks - set OPENAI_API_KEY or GEMINI_API_KEY.")
+
+    if record is not None:
+        record["agents"] = agents
+        record["rounds"] = []
+        record["started_at"] = datetime.now().isoformat()
+
+    def close(outcome: str) -> str:
+        if record is not None:
+            record["outcome"] = outcome
+            record["finished_at"] = datetime.now().isoformat()
+        return article
+
     for round_no in range(1, max_rounds + 1):
-        report = verify_content(article, outline, key_takeaways, research, round_no)
+        report = verify_content(article, outline, key_takeaways, research, round_no,
+                                agents=agents)
         issues = report.get("issues", []) or []
+
+        entry = {"round": round_no, "verdict": report.get("verdict"),
+                 "scores": report.get("scores", {}), "issues": issues,
+                 "responses": [], "rulings": [], "applied": []}
+        if record is not None:
+            record["rounds"].append(entry)
 
         if report.get("verdict") == "pass" or not issues:
             print(f"  Verification passed on round {round_no}. No changes applied.")
-            return article
+            return close(f"passed on round {round_no}")
 
         by_id = {i.get("id"): i for i in issues if i.get("id")}
         rebuttal = writer_rebuttal(article, issues)
+        entry["responses"] = rebuttal.get("responses", []) or []
 
         upheld, disputed = [], []
         answered = set()
-        for r in rebuttal.get("responses", []) or []:
+        for r in entry["responses"]:
             issue = by_id.get(r.get("id"))
             if not issue:
                 continue
@@ -1422,24 +2262,116 @@ def verification_loop(article: str, outline: str, key_takeaways: str, research: 
             else:
                 upheld.append(issue)
         # A finding the writer never answered is not a dispute - apply it.
-        upheld += [i for k, i in by_id.items() if k not in answered]
+        unanswered = [i for k, i in by_id.items() if k not in answered]
+        entry["unanswered"] = [i.get("id") for i in unanswered]
+        upheld += unanswered
 
         if disputed:
-            rulings = judge_disputes(article, disputed)
-            ruled = {r.get("id"): r.get("ruling") for r in rulings.get("rulings", []) or []}
+            rulings = judge_disputes(article, disputed, agents=agents)
+            entry["rulings"] = rulings.get("rulings", []) or []
+            ruled = {r.get("id"): r.get("ruling") for r in entry["rulings"]}
             for issue in disputed:
                 # An unruled dispute defaults to the writer keeping the text.
                 if ruled.get(issue.get("id")) == "uphold":
                     upheld.append(issue)
+                elif issue.get("id") not in ruled:
+                    entry.setdefault("unruled", []).append(issue.get("id"))
+
+        entry["applied"] = [i.get("id") for i in upheld]
 
         if not upheld:
             print("  Every finding was overruled. Article left as written.")
-            return article
+            return close(f"every finding overruled on round {round_no}")
 
         article = apply_fixes(article, upheld)
+        entry["words_after_fix"] = len(article.split())
 
     print(f"  Reached the {max_rounds}-round limit. Using the latest revision.")
-    return article
+    return close(f"hit the {max_rounds}-round limit")
+
+
+# ---------------------------------------------------------------------------
+# Step 6.5 review report
+# ---------------------------------------------------------------------------
+
+def format_review(record: dict, title: str = "") -> str:
+    """The argument as a readable document: who said what, and what survived."""
+    if not record.get("rounds"):
+        return "# Verification review\n\nThe audit did not run.\n"
+
+    heading = f"# Verification review: {title}" if title else "# Verification review"
+    out = [heading, "", "## Who argued", "", "| Role | Model | Vendor |", "|---|---|---|"]
+    for role, a in (record.get("agents") or {}).items():
+        out.append(f"| {role} | `{a['model']}` | {a['provider']} |")
+    out += ["", f"Outcome: **{record.get('outcome', 'unknown')}**", ""]
+
+    for entry in record["rounds"]:
+        out += [f"## Round {entry['round']} - verdict: {entry.get('verdict', '?')}", ""]
+        scores = entry.get("scores") or {}
+        if scores:
+            out.append("| " + " | ".join(scores) + " |")
+            out.append("|" + "---|" * len(scores))
+            out.append("| " + " | ".join(str(v) for v in scores.values()) + " |")
+            out.append("")
+
+        issues = entry.get("issues") or []
+        if not issues:
+            out += ["No findings.", ""]
+            continue
+
+        stances = {r.get("id"): r.get("stance") for r in entry.get("responses") or []}
+        reasons = {r.get("id"): r.get("reason", "") for r in entry.get("responses") or []}
+        rulings = {r.get("id"): r.get("ruling") for r in entry.get("rulings") or []}
+        why = {r.get("id"): r.get("reasoning", "") for r in entry.get("rulings") or []}
+        applied = set(entry.get("applied") or [])
+
+        for issue in issues:
+            iid = issue.get("id")
+            stance = stances.get(iid)
+            out += [f"### {iid} - {issue.get('category', '?')} "
+                    f"({issue.get('severity', '?')})", ""]
+            if issue.get("quote"):
+                out += [f'> {issue["quote"]}', ""]
+            out.append(f"**Auditor:** {issue.get('problem', '')} "
+                       f"_Wants:_ {issue.get('fix', '')}")
+            if stance is None:
+                out.append("**Writer:** did not respond - counted as accepted.")
+            else:
+                label = {"accept": "accepted", "dispute": "disputed"}.get(stance, stance)
+                out.append(f"**Writer:** {label}. {reasons.get(iid, '')}")
+            if iid in rulings:
+                out.append(f"**Judge:** {rulings[iid]}. {why.get(iid, '')}")
+            elif stance == "dispute":
+                out.append("**Judge:** no ruling returned - the text stands.")
+            out += ["", f"**Result:** {'applied' if iid in applied else 'not applied'}", ""]
+
+    return "\n".join(out) + "\n"
+
+
+def write_review(slug: str, record: dict, output_dir: Path, title: str = "") -> tuple:
+    """Save the argument next to the article, as JSON and as something readable."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"{slug}_review.json"
+    md_path = output_dir / f"{slug}_review.md"
+    json_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
+    md_path.write_text(format_review(record, title), encoding="utf-8")
+    return md_path, json_path
+
+
+def review_stats(record: dict) -> dict:
+    """Headline numbers for the run summary."""
+    stats = dict(rounds=0, raised=0, accepted=0, disputed=0, upheld=0,
+                 overruled=0, applied=0)
+    for entry in record.get("rounds", []):
+        stats["rounds"] += 1
+        stats["raised"] += len(entry.get("issues") or [])
+        for r in entry.get("responses") or []:
+            key = "disputed" if r.get("stance") == "dispute" else "accepted"
+            stats[key] += 1
+        for r in entry.get("rulings") or []:
+            stats["upheld" if r.get("ruling") == "uphold" else "overruled"] += 1
+        stats["applied"] += len(entry.get("applied") or [])
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -1483,10 +2415,18 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     # Step 6: Humanize
     humanized = humanize_content(content)
 
+    # Step 6.4: Direct-answer block. Inserted before verification, so the auditor
+    # checks it against the brief like any other passage.
+    humanized = insert_answer_block(
+        humanized, generate_answer_block(refined_title, humanized, research)
+    )
+
     # Step 6.5: Verify -> rebut -> judge -> fix
+    record = {}
     if verify:
         humanized = verification_loop(
-            humanized, outline, key_takeaways, research, max_rounds=verify_rounds
+            humanized, outline, key_takeaways, research, max_rounds=verify_rounds,
+            record=record,
         )
     else:
         log("STEP 6.5", "Verification skipped (--no-verify)")
@@ -1504,6 +2444,11 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     slug = slugify(refined_title)
     md_path, meta_path = write_outputs(slug, final_article, meta, images, output_dir, edition=edition)
 
+    review_path = None
+    if record.get("rounds"):
+        review_path, _ = write_review(slug, record, output_dir, refined_title)
+    usage_path = write_usage(slug, output_dir, refined_title)
+
     # Summary
     word_count = len(final_article.split())
     print(f"\n{'='*60}")
@@ -1513,6 +2458,96 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     print(f"  Images     : {len(images)}")
     print(f"  Article    : {md_path}")
     print(f"  Meta JSON  : {meta_path}")
+    if review_path:
+        s = review_stats(record)
+        print(f"  Review     : {review_path}")
+        print(f"  Argument   : {s['raised']} raised, {s['disputed']} disputed, "
+              f"{s['upheld']} upheld, {s['overruled']} overruled, "
+              f"{s['applied']} applied over {s['rounds']} round(s)")
+    print(f"  Usage JSON : {usage_path}")
+    print_usage_summary()
+    print(f"{'='*60}\n")
+
+
+def audit_only(path: Path, output_dir: Path, topic: str = "", intent: str = "",
+               verify_rounds: int = 2, apply: bool = False):
+    """Point the three agents at a document you already have.
+
+    The auditor works by comparing an article against the brief it was written
+    from, and a file you hand it has no brief. So one call reconstructs the brief
+    the document appears to be written to - its own outline and the takeaways it
+    seems to promise - and the agents argue against that.
+    """
+    article = path.read_text(encoding="utf-8")
+    title = topic or path.stem.replace("-", " ")
+
+    print(f"\n{'='*60}")
+    print(f"Audit only - no article is written")
+    print(f"Document: {path}  ({len(article.split()):,} words)")
+    print(f"Rounds  : {verify_rounds}   Apply fixes: {'yes' if apply else 'no'}")
+    print(f"{'='*60}")
+
+    log("BRIEF", "Reconstructing the brief this document was written to...")
+    brief_prompt = f"""Read the document and infer the brief it appears to have been
+written to. Do not judge it yet - only describe what it is trying to do.
+
+{f"The author says the goal was: {intent}" if intent else ""}
+
+Return ONLY valid JSON:
+{{
+  "primary_keyword": "<the phrase this is optimised for>",
+  "secondary_keywords": ["<up to 6>"],
+  "search_intent": "<informational | commercial | transactional | navigational>",
+  "target_audience": "<one line>",
+  "article_goal": "<one line>",
+  "outline": "<the document's actual heading structure, as markdown headings>",
+  "key_takeaways": "<the points it promises the reader, as a markdown list>"
+}}
+
+DOCUMENT
+{article}"""
+    brief = extract_json(call_claude(brief_prompt, max_tokens=4000))
+
+    research = {
+        "keywords": {"primary_keyword": brief.get("primary_keyword", title),
+                     "secondary_keywords": brief.get("secondary_keywords", [])},
+        "search_intent": brief.get("search_intent", ""),
+        "target_audience": brief.get("target_audience", ""),
+        "article_goal": brief.get("article_goal", ""),
+        "serp_context": "(no live SERP data - this document was audited, not researched)",
+    }
+    print(f"  Keyword : {research['keywords']['primary_keyword']}")
+    print(f"  Audience: {research['target_audience']}")
+
+    record = {}
+    revised = verification_loop(article, brief.get("outline", ""),
+                                brief.get("key_takeaways", ""), research,
+                                max_rounds=verify_rounds, record=record)
+
+    slug = slugify(title)
+    review_path, json_path = write_review(slug, record, output_dir, title)
+
+    revised_path = None
+    if apply and revised != article:
+        revised_path = output_dir / f"{slug}_revised.md"
+        revised_path.write_text(revised, encoding="utf-8")
+
+    s = review_stats(record)
+    print(f"\n{'='*60}")
+    print(f"AUDIT COMPLETE")
+    print(f"  Rounds     : {s['rounds']}")
+    print(f"  Raised     : {s['raised']}")
+    print(f"  Accepted   : {s['accepted']}   Disputed: {s['disputed']}")
+    print(f"  Upheld     : {s['upheld']}   Overruled: {s['overruled']}")
+    print(f"  Applied    : {s['applied']}")
+    print(f"  Review     : {review_path}")
+    print(f"  Raw JSON   : {json_path}")
+    if revised_path:
+        print(f"  Revised    : {revised_path}")
+    elif apply:
+        print(f"  Revised    : nothing changed, no file written")
+    print(f"  Usage JSON : {write_usage(slug, output_dir, title)}")
+    print_usage_summary()
     print(f"{'='*60}\n")
 
 
@@ -1524,7 +2559,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate a full SEO article with web-sourced images."
     )
-    parser.add_argument("topic", help='Article topic, e.g. "What is RAG in AI"')
+    parser.add_argument(
+        "topic",
+        nargs="?",
+        default=None,
+        help=('Article topic, e.g. "What is RAG in AI". Optional with --audit, '
+              'where it only names the document being audited.'),
+    )
     parser.add_argument(
         "--intent",
         default=None,
@@ -1569,11 +2610,29 @@ def main():
         default=2,
         help="Maximum audit/fix rounds before accepting the article (default: 2)",
     )
+    parser.add_argument(
+        "--audit",
+        metavar="FILE",
+        default=None,
+        help=(
+            "Audit a document you already have instead of writing a new one. The "
+            "three agents argue about your text and a review report is written; "
+            "no article, images or meta are generated."
+        ),
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="With --audit, also save the revised document as <slug>_revised.md",
+    )
     args = parser.parse_args()
 
     if not os.getenv("ANTHROPIC_API_KEY"):
         print("ERROR: ANTHROPIC_API_KEY environment variable is not set.", file=sys.stderr)
         sys.exit(1)
+
+    if not args.audit and not args.topic:
+        parser.error("a topic is required unless you pass --audit FILE")
 
     # --intent takes priority; --keywords is the legacy shorthand; topic is the fallback
     intent = args.intent or ""
@@ -1581,6 +2640,20 @@ def main():
     output_dir = Path(args.output_dir)
 
     try:
+        if args.audit:
+            doc = Path(args.audit)
+            if not doc.exists():
+                print(f"ERROR: no such file: {doc}", file=sys.stderr)
+                sys.exit(1)
+            audit_only(
+                doc,
+                output_dir=output_dir,
+                topic=args.topic or "",
+                intent=intent,
+                verify_rounds=args.verify_rounds,
+                apply=args.apply,
+            )
+            return
         run(
             title=args.topic,
             keywords=keywords,

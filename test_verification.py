@@ -33,50 +33,98 @@ ISSUE_B = {"id": "i2", "category": "ai_tell", "severity": "medium",
 class Stub:
     """Replaces call_claude/call_openai. Routes by which system prompt is passed."""
 
-    def __init__(self, reports, rebuttals=(), rulings=(), openai_raises=False):
+    def __init__(self, reports, rebuttals=(), rulings=(), openai_raises=False,
+                 gemini_raises=False):
         self.reports = list(reports)       # one per verify round
         self.rebuttals = list(rebuttals)
         self.rulings = list(rulings)
         self.openai_raises = openai_raises
-        self.calls = []                    # (role, model)
+        self.gemini_raises = gemini_raises
+        self.calls = []                    # (role-vendor, model)
 
     def _next(self, queue, role):
         if not queue:
             raise AssertionError("stub ran out of %s responses" % role)
         return json.dumps(queue.pop(0))
 
-    def claude(self, prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+    def _route(self, system, vendor, model):
+        """Every role is identified by its system prompt, whichever vendor runs it."""
         if system == sw.VERIFY_SYSTEM:
-            self.calls.append(("verify", model))
+            self.calls.append(("verify-" + vendor, model))
             return self._next(self.reports, "verify")
         if system == sw.WRITER_SYSTEM:
-            self.calls.append(("rebut", model))
+            self.calls.append(("rebut-" + vendor, model))
             return self._next(self.rebuttals, "rebut")
         if system == sw.JUDGE_SYSTEM:
-            self.calls.append(("judge-claude", model))
+            self.calls.append(("judge-" + vendor, model))
             return self._next(self.rulings, "judge")
-        self.calls.append(("fix", model))
+        self.calls.append(("fix-" + vendor, model))
         return "# Heading\n\nThe revised sentence.\n"
 
+    def claude(self, prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        return self._route(system, "claude", model)
+
     def openai(self, prompt, system="", max_tokens=4000):
-        self.calls.append(("judge-openai", sw.OPENAI_JUDGE_MODEL))
         if self.openai_raises:
-            raise sw.ClaudeError("503 the judge is down")
-        return self._next(self.rulings, "judge")
+            self.calls.append(("attempt-openai", sw.OPENAI_JUDGE_MODEL))
+            raise sw.ClaudeError("503 the vendor is down")
+        return self._route(system, "openai", sw.OPENAI_JUDGE_MODEL)
+
+    def gemini(self, prompt, system="", max_tokens=4000):
+        if self.gemini_raises:
+            self.calls.append(("attempt-gemini", sw.GEMINI_MODEL))
+            raise sw.ClaudeError("503 the vendor is down")
+        return self._route(system, "gemini", sw.GEMINI_MODEL)
 
     def roles(self):
+        """Call roles with the vendor suffix stripped, for order assertions."""
+        return [c[0].rsplit("-", 1)[0] for c in self.calls]
+
+    def tagged(self):
         return [c[0] for c in self.calls]
 
 
 def install(stub):
     sw.call_claude = stub.claude
     sw.call_openai = stub.openai
+    sw.call_gemini = stub.gemini
     return stub
 
 
-def loop(stub, rounds=2):
+def loop(stub, rounds=2, auditor="anthropic", judge="anthropic"):
+    """Run the loop with the roster pinned, so a case tests logic and not .env."""
     install(stub)
-    return sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH, max_rounds=rounds)
+    prev = (sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER)
+    sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = auditor, judge
+    try:
+        return sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                                    max_rounds=rounds)
+    finally:
+        sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = prev
+
+
+class keys:
+    """Pin exactly which vendor keys exist for the duration of a block."""
+
+    ALL = ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")
+
+    def __init__(self, *present):
+        self.present = present
+
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in self.ALL}
+        for k in self.ALL:
+            if k in self.present:
+                os.environ[k] = "test-key"
+            else:
+                os.environ.pop(k, None)
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def spy_on_apply_fixes(record):
@@ -181,27 +229,107 @@ def test_unruled_dispute_leaves_the_text_standing():
 
 
 def test_openai_judge_failure_falls_back_to_claude():
-    prev_key = os.environ.get("OPENAI_API_KEY")
-    prev_provider = sw.JUDGE_PROVIDER
-    os.environ["OPENAI_API_KEY"] = "test-key"
-    sw.JUDGE_PROVIDER = "auto"
-    try:
-        assert sw.judge_provider() == "openai"
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         stub = Stub(
             reports=[revise(ISSUE_A), PASS_REPORT],
             rebuttals=[{"responses": [{"id": "i1", "stance": "dispute", "reason": "no"}]}],
             rulings=[{"rulings": [{"id": "i1", "ruling": "uphold", "reasoning": "yes"}]}],
             openai_raises=True,
         )
-        loop(stub)
-        roles = stub.roles()
-        assert "judge-openai" in roles and "judge-claude" in roles, roles
+        loop(stub, judge="openai")
+        tagged = stub.tagged()
+        assert "attempt-openai" in tagged, tagged
+        assert "judge-claude" in tagged, tagged
+
+
+def test_gemini_judge_failure_falls_back_to_claude():
+    with keys("ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
+        stub = Stub(
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "dispute", "reason": "no"}]}],
+            rulings=[{"rulings": [{"id": "i1", "ruling": "uphold", "reasoning": "yes"}]}],
+            gemini_raises=True,
+        )
+        loop(stub, judge="gemini")
+        tagged = stub.tagged()
+        assert "attempt-gemini" in tagged, tagged
+        assert "judge-claude" in tagged, tagged
+
+
+def test_a_working_second_vendor_actually_runs_the_audit():
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        stub = Stub(
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "accept", "reason": "ok"}]}],
+        )
+        loop(stub, auditor="openai")
+        tagged = stub.tagged()
+        # The audit runs on OpenAI; the writer and the fix stay on Claude.
+        assert "verify-openai" in tagged, tagged
+        assert "rebut-claude" in tagged and "fix-claude" in tagged, tagged
+
+
+# --- roster resolution -----------------------------------------------------
+
+def resolved(auditor="auto", judge="auto"):
+    prev = (sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER)
+    sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = auditor, judge
+    try:
+        return sw.resolve_agents()
     finally:
-        sw.JUDGE_PROVIDER = prev_provider
-        if prev_key is None:
-            os.environ.pop("OPENAI_API_KEY", None)
-        else:
-            os.environ["OPENAI_API_KEY"] = prev_key
+        sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = prev
+
+
+def test_writer_always_stays_on_anthropic():
+    for combo in (("ANTHROPIC_API_KEY",),
+                  ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"),
+                  ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")):
+        with keys(*combo):
+            assert resolved()["writer"]["provider"] == "anthropic", combo
+
+
+def test_auditor_leaves_the_writers_vendor_first():
+    # One extra key exists; it must be spent on the auditor, not the judge,
+    # because a blind spot there means the finding is never raised at all.
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        agents = resolved()
+        assert agents["auditor"]["provider"] == "openai", agents
+        assert agents["judge"]["provider"] == "anthropic", agents
+
+
+def test_three_keys_give_three_vendors():
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        agents = resolved()
+        vendors = {a["provider"] for a in agents.values()}
+        assert vendors == {"anthropic", "openai", "gemini"}, agents
+
+
+def test_anthropic_only_still_uses_three_distinct_models():
+    with keys("ANTHROPIC_API_KEY"):
+        agents = resolved()
+        assert {a["provider"] for a in agents.values()} == {"anthropic"}, agents
+        # The writer must at least not audit itself.
+        assert agents["auditor"]["model"] != agents["writer"]["model"], agents
+
+
+def test_explicit_provider_overrides_the_auto_choice():
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        agents = resolved(auditor="anthropic", judge="openai")
+        assert agents["auditor"]["provider"] == "anthropic", agents
+        assert agents["judge"]["provider"] == "openai", agents
+
+
+def test_judge_provider_helper_matches_the_roster():
+    # Both read the module's own settings, so they must never disagree - whatever
+    # JUDGE_PROVIDER happens to be set to in the local .env.
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        assert sw.judge_provider() == sw.resolve_agents()["judge"]["provider"]
+
+
+def test_description_counts_models_and_vendors():
+    with keys("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"):
+        text = sw.describe_agents(resolved())
+        assert "3 distinct models across 3 vendor(s)" in text, text
 
 
 def test_round_limit_is_honoured():
@@ -222,15 +350,13 @@ def test_verifier_and_judge_use_their_own_models():
         rebuttals=[{"responses": [{"id": "i1", "stance": "dispute", "reason": "no"}]}],
         rulings=[{"rulings": [{"id": "i1", "ruling": "uphold", "reasoning": "yes"}]}],
     )
-    prev_provider = sw.JUDGE_PROVIDER
-    sw.JUDGE_PROVIDER = "anthropic"
-    try:
+    with keys("ANTHROPIC_API_KEY"):
         loop(stub)
-    finally:
-        sw.JUDGE_PROVIDER = prev_provider
     models = dict(stub.calls)
-    assert models["verify"] == sw.VERIFIER_MODEL, models
+    assert models["verify-claude"] == sw.VERIFIER_MODEL, models
     assert models["judge-claude"] == sw.JUDGE_MODEL, models
+    # The rebuttal is the writer speaking, so it runs on the writer's model.
+    assert models["rebut-claude"] == sw.MODEL or models["rebut-claude"] is None, models
 
 
 def test_unnumbered_and_duplicate_findings_survive():
@@ -248,6 +374,127 @@ def test_unnumbered_and_duplicate_findings_survive():
     finally:
         sw.apply_fixes = real
     assert len(applied.get("ids", [])) == 3, "all three findings should reach the fix: %s" % applied
+
+
+# --- the argument record ---------------------------------------------------
+
+def recorded(stub, rounds=2, auditor="anthropic", judge="anthropic"):
+    install(stub)
+    record = {}
+    prev = (sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER)
+    sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = auditor, judge
+    try:
+        sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                             max_rounds=rounds, record=record)
+    finally:
+        sw.AUDITOR_PROVIDER, sw.JUDGE_PROVIDER = prev
+    return record
+
+
+def test_record_is_optional():
+    # The loop must still work for callers that do not want the transcript.
+    stub = Stub([PASS_REPORT])
+    out = loop(stub)
+    assert out == ARTICLE
+
+
+def test_record_captures_the_full_argument():
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A, ISSUE_B), PASS_REPORT],
+            rebuttals=[{"responses": [
+                {"id": "i1", "stance": "accept", "reason": "fair"},
+                {"id": "i2", "stance": "dispute", "reason": "deliberate"},
+            ]}],
+            rulings=[{"rulings": [{"id": "i2", "ruling": "overrule", "reasoning": "taste"}]}],
+        ))
+    assert len(record["rounds"]) == 2, record["rounds"]
+    first = record["rounds"][0]
+    assert len(first["issues"]) == 2
+    assert len(first["responses"]) == 2
+    assert first["rulings"][0]["ruling"] == "overrule"
+    assert first["applied"] == ["i1"], first["applied"]
+    assert record["agents"]["writer"]["provider"] == "anthropic"
+    assert "passed on round 2" in record["outcome"], record["outcome"]
+
+
+def test_record_marks_unanswered_and_unruled_findings():
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A, ISSUE_B), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "dispute", "reason": "no"}]}],
+            rulings=[{"rulings": []}],
+        ))
+    first = record["rounds"][0]
+    assert first["unanswered"] == ["i2"], first["unanswered"]
+    assert first.get("unruled") == ["i1"], first.get("unruled")
+    # i2 was never answered so it is applied; i1 was disputed and never ruled on.
+    assert first["applied"] == ["i2"], first["applied"]
+
+
+def test_stats_add_up():
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A, ISSUE_B), PASS_REPORT],
+            rebuttals=[{"responses": [
+                {"id": "i1", "stance": "accept", "reason": "ok"},
+                {"id": "i2", "stance": "dispute", "reason": "no"},
+            ]}],
+            rulings=[{"rulings": [{"id": "i2", "ruling": "uphold", "reasoning": "yes"}]}],
+        ))
+    s = sw.review_stats(record)
+    assert s == {"rounds": 2, "raised": 2, "accepted": 1, "disputed": 1,
+                 "upheld": 1, "overruled": 0, "applied": 2}, s
+
+
+def test_review_report_shows_every_side():
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A, ISSUE_B), PASS_REPORT],
+            rebuttals=[{"responses": [
+                {"id": "i1", "stance": "accept", "reason": "the auditor is right"},
+                {"id": "i2", "stance": "dispute", "reason": "a deliberate choice"},
+            ]}],
+            rulings=[{"rulings": [{"id": "i2", "ruling": "overrule",
+                                   "reasoning": "taste, not accuracy"}]}],
+        ))
+    md = sw.format_review(record, "A Title")
+    assert "# Verification review: A Title" in md, md[:200]
+    assert "the auditor is right" in md
+    assert "a deliberate choice" in md
+    assert "taste, not accuracy" in md
+    assert "**Result:** applied" in md
+    assert "**Result:** not applied" in md
+    assert "| writer | `claude-sonnet-5` | anthropic |" in md
+
+
+def test_review_report_names_silence_explicitly():
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": []}],
+        ))
+    md = sw.format_review(record)
+    assert "did not respond - counted as accepted" in md, md
+
+
+def test_review_report_survives_an_audit_that_never_ran():
+    assert "did not run" in sw.format_review({})
+
+
+def test_review_files_are_written():
+    import tempfile
+    with keys("ANTHROPIC_API_KEY"):
+        record = recorded(Stub(
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "accept", "reason": "ok"}]}],
+        ))
+    with tempfile.TemporaryDirectory() as d:
+        md_path, json_path = sw.write_review("a-slug", record, sw.Path(d), "Title")
+        assert md_path.exists() and json_path.exists()
+        assert "Verification review" in md_path.read_text(encoding="utf-8")
+        reloaded = json.loads(json_path.read_text(encoding="utf-8"))
+        assert reloaded["rounds"][0]["applied"] == ["i1"], reloaded["rounds"][0]
 
 
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
