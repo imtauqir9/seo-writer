@@ -10,18 +10,22 @@ Run:
 Then open http://localhost:5000
 """
 
+import hashlib
+import hmac
 import json
 import os
 import queue
-import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+from flask import (Flask, Response, jsonify, redirect, render_template, request,
+                   send_from_directory, session, url_for)
 
 app = Flask(__name__)
 BASE_DIR = Path(__file__).parent
@@ -59,6 +63,152 @@ SILENCE_LIMIT_SECS = 900
 # In-memory job store: job_id → queue.Queue
 _jobs: dict[str, queue.Queue] = {}
 _jobs_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Access control
+# ---------------------------------------------------------------------------
+#
+# POST /api/start spends real money - roughly fifteen model calls across three
+# vendors, two of them high-effort. Deployed without a password that endpoint is
+# an open faucet on someone else's card, so set APP_PASSWORD anywhere the app is
+# reachable from the internet.
+
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+APP_USERNAME = os.environ.get("APP_USERNAME", "admin")
+
+# A browser gets a real login form and a session cookie; scripts and curl keep
+# working with basic auth against the same password. Either satisfies the gate.
+#
+# The signing key defaults to something derived from the password, so sessions
+# survive a restart without a second secret to manage - and changing the
+# password signs everyone out, which is what you want from a password change.
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
+app.secret_key = SECRET_KEY or hashlib.sha256(
+    ("humanly-session-v1:" + APP_PASSWORD).encode()
+).hexdigest()
+
+# Fly sets FLY_APP_NAME, and Fly is always HTTPS. Locally the app is plain HTTP,
+# where a Secure cookie would never be sent back and the login would loop.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("FLY_APP_NAME")),
+)
+
+# Public because a browser must reach them before it can authenticate, and
+# because a health check should not need a credential.
+_OPEN_PATHS = {"/healthz", "/login"}
+
+# A login form on a public URL is a brute-force target. This is deliberately
+# small: a per-IP counter, not a rate-limiting library.
+_LOGIN_MAX_ATTEMPTS = 8
+_LOGIN_LOCKOUT_SECS = 300
+_login_failures: dict[str, list] = {}
+_login_lock = threading.Lock()
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("Fly-Client-IP") or request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() or request.remote_addr or "unknown")
+
+
+def _locked_out(ip: str) -> int:
+    """Seconds remaining on a lockout, or 0."""
+    with _login_lock:
+        hits = [t for t in _login_failures.get(ip, [])
+                if time.time() - t < _LOGIN_LOCKOUT_SECS]
+        _login_failures[ip] = hits
+        if len(hits) >= _LOGIN_MAX_ATTEMPTS:
+            return int(_LOGIN_LOCKOUT_SECS - (time.time() - hits[0])) + 1
+    return 0
+
+
+def _record_failure(ip: str):
+    with _login_lock:
+        _login_failures.setdefault(ip, []).append(time.time())
+
+
+def _clear_failures(ip: str):
+    with _login_lock:
+        _login_failures.pop(ip, None)
+
+
+def _password_ok(candidate: str) -> bool:
+    return hmac.compare_digest(candidate or "", APP_PASSWORD)
+
+
+def _basic_auth_ok() -> bool:
+    auth = request.authorization
+    if not auth or auth.type != "basic":
+        return False
+    # compare_digest on both halves, so neither the username nor the password
+    # leaks its length through response timing.
+    return (hmac.compare_digest(auth.username or "", APP_USERNAME)
+            and _password_ok(auth.password or ""))
+
+
+def _logged_in() -> bool:
+    return session.get("auth") is True
+
+
+@app.before_request
+def require_password():
+    if not APP_PASSWORD or request.path in _OPEN_PATHS:
+        return None
+    if _logged_in() or _basic_auth_ok():
+        return None
+    # An API caller wants a 401 it can handle, not an HTML login page.
+    if request.path.startswith("/api/"):
+        return Response(
+            "Authentication required.\n", 401,
+            {"WWW-Authenticate": 'Basic realm="Humanly", charset="UTF-8"'},
+        )
+    return redirect(url_for("login", next=request.full_path.rstrip("?")))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if not APP_PASSWORD:
+        return redirect(url_for("index"))
+    if _logged_in():
+        return redirect(url_for("index"))
+
+    target = request.args.get("next") or request.form.get("next") or "/"
+    # Only ever bounce to a path on this app, never to another host.
+    if not target.startswith("/") or target.startswith("//"):
+        target = "/"
+
+    error = None
+    if request.method == "POST":
+        ip = _client_ip()
+        wait = _locked_out(ip)
+        if wait:
+            error = f"Too many attempts. Try again in {wait} seconds."
+        elif _password_ok(request.form.get("password", "")):
+            _clear_failures(ip)
+            session.clear()
+            session["auth"] = True
+            session.permanent = False
+            return redirect(target)
+        else:
+            _record_failure(ip)
+            error = "That password is not right."
+
+    return render_template("login.html", error=error, next=target), (
+        200 if error is None else 401
+    )
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "protected": bool(APP_PASSWORD)})
 
 
 def list_articles() -> list[dict]:
@@ -125,6 +275,81 @@ def serve_output(filename):
 @app.route("/api/articles")
 def api_articles():
     return jsonify(list_articles())
+
+
+# ---------------------------------------------------------------------------
+# Token usage
+# ---------------------------------------------------------------------------
+
+def read_usage(limit: int = 500) -> list[dict]:
+    """Every run the pipeline has logged, newest first."""
+    path = OUTPUT_DIR / "usage.jsonl"
+    if not path.exists():
+        return []
+    runs = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            runs.append(json.loads(line))
+        except ValueError:
+            continue          # a torn write should not blank the whole dashboard
+    return list(reversed(runs))[:limit]
+
+
+def usage_rollup(runs: list[dict]) -> dict:
+    """Totals overall, per model, and per day."""
+    total = {"runs": len(runs), "calls": 0, "input_tokens": 0,
+             "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+             "fully_priced": True}
+    by_model, by_day = defaultdict(lambda: {"calls": 0, "input_tokens": 0,
+                                            "output_tokens": 0, "cost_usd": 0.0}), \
+        defaultdict(lambda: {"runs": 0, "total_tokens": 0, "cost_usd": 0.0})
+
+    for r in runs:
+        total["calls"] += r.get("calls", 0)
+        total["input_tokens"] += r.get("input_tokens", 0)
+        total["output_tokens"] += r.get("output_tokens", 0)
+        total["total_tokens"] += r.get("total_tokens", 0)
+        total["cost_usd"] += r.get("cost_usd", 0.0)
+        if not r.get("fully_priced", True):
+            total["fully_priced"] = False
+
+        day = (r.get("at") or "")[:10] or "unknown"
+        by_day[day]["runs"] += 1
+        by_day[day]["total_tokens"] += r.get("total_tokens", 0)
+        by_day[day]["cost_usd"] += r.get("cost_usd", 0.0)
+
+        for model, m in (r.get("by_model") or {}).items():
+            bucket = by_model[model]
+            bucket["calls"] += m.get("calls", 0)
+            bucket["input_tokens"] += m.get("input_tokens", 0)
+            bucket["output_tokens"] += m.get("output_tokens", 0)
+            bucket["cost_usd"] += m.get("cost_usd", 0.0)
+
+    runs_n = max(total["runs"], 1)
+    total["avg_tokens_per_run"] = round(total["total_tokens"] / runs_n)
+    total["avg_cost_per_run"] = round(total["cost_usd"] / runs_n, 3)
+    return {
+        "total": total,
+        "by_model": dict(sorted(by_model.items(),
+                                key=lambda kv: -kv[1]["cost_usd"])),
+        "by_day": dict(sorted(by_day.items(), reverse=True)),
+    }
+
+
+@app.route("/api/usage")
+def api_usage():
+    runs = read_usage()
+    return jsonify({**usage_rollup(runs), "runs": runs})
+
+
+@app.route("/usage")
+def usage_dashboard():
+    runs = read_usage()
+    roll = usage_rollup(runs)
+    return render_template("usage.html", runs=runs, **roll)
 
 
 @app.route("/api/start", methods=["POST"])

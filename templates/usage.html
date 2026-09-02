@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Token usage — Humanly</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body { font-family: Arial, sans-serif; background: #f5f5f5; color: #222; min-height: 100vh; }
+
+  header {
+    background: #111; color: #fff; padding: 18px 32px;
+    display: flex; align-items: center; gap: 12px;
+  }
+  header h1 { font-size: 1.2rem; font-weight: 700; letter-spacing: -0.3px; }
+  header span { font-size: 0.85rem; color: #aaa; }
+  header a { margin-left: auto; color: #aaa; font-size: 0.85rem; text-decoration: none; }
+  header a:hover { color: #fff; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-bottom: 28px; }
+  .card { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 16px 18px; }
+  .card .label { font-size: 0.72rem; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card .value { font-size: 1.5rem; font-weight: 700; color: #111; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .card .sub { font-size: 0.75rem; color: #888; margin-top: 3px; }
+
+  h2 { font-size: 0.95rem; font-weight: 700; color: #111; margin: 26px 0 10px; }
+
+  table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; overflow: hidden; }
+  th, td { padding: 9px 14px; text-align: left; font-size: 0.85rem; border-bottom: 1px solid #eee; }
+  th { background: #fafafa; font-size: 0.72rem; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.4px; }
+  tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.model { font-family: Consolas, monospace; font-size: 0.8rem; }
+
+  .bar { height: 5px; background: #111; border-radius: 3px; min-width: 2px; }
+  .barcell { width: 130px; }
+
+  .note { background: #fffbe6; border: 1px solid #f0e0a0; border-radius: 6px; padding: 12px 16px; font-size: 0.82rem; color: #705c00; margin-bottom: 22px; }
+  .empty { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 40px; text-align: center; color: #888; font-size: 0.9rem; }
+  .muted { color: #999; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Token usage</h1>
+  <span>{{ total.runs }} run{{ '' if total.runs == 1 else 's' }} logged</span>
+  <a href="/">&larr; Back to articles</a>
+  <a href="/logout" style="margin-left:18px;">Sign out</a>
+</header>
+
+<main>
+
+{% if not runs %}
+  <div class="empty">
+    No usage logged yet. Every pipeline run appends a line to
+    <code>output/usage.jsonl</code> — generate an article and it will show up here.
+  </div>
+{% else %}
+
+  {% if not total.fully_priced %}
+    <div class="note">
+      <strong>Partial pricing.</strong> At least one model has no entry in
+      <code>MODEL_PRICES</code>, so its tokens are counted but its cost is not.
+      The dollar figures below are a floor, not a total.
+    </div>
+  {% endif %}
+
+  <div class="cards">
+    <div class="card">
+      <div class="label">Total tokens</div>
+      <div class="value">{{ '{:,}'.format(total.total_tokens) }}</div>
+      <div class="sub">{{ '{:,}'.format(total.input_tokens) }} in / {{ '{:,}'.format(total.output_tokens) }} out</div>
+    </div>
+    <div class="card">
+      <div class="label">Estimated cost</div>
+      <div class="value">${{ '%.2f'|format(total.cost_usd) }}</div>
+      <div class="sub">{{ 'all models priced' if total.fully_priced else 'floor — some unpriced' }}</div>
+    </div>
+    <div class="card">
+      <div class="label">API calls</div>
+      <div class="value">{{ '{:,}'.format(total.calls) }}</div>
+      <div class="sub">across {{ total.runs }} run{{ '' if total.runs == 1 else 's' }}</div>
+    </div>
+    <div class="card">
+      <div class="label">Per article</div>
+      <div class="value">${{ '%.2f'|format(total.avg_cost_per_run) }}</div>
+      <div class="sub">{{ '{:,}'.format(total.avg_tokens_per_run) }} tokens avg</div>
+    </div>
+  </div>
+
+  <h2>By model</h2>
+  <table>
+    <tr>
+      <th>Model</th><th class="num">Calls</th><th class="num">Input</th>
+      <th class="num">Output</th><th class="num">Cost</th><th></th>
+    </tr>
+    {% set top = (by_model.values()|map(attribute='cost_usd')|max) if by_model else 0 %}
+    {% for model, m in by_model.items() %}
+      <tr>
+        <td class="model">{{ model }}</td>
+        <td class="num">{{ '{:,}'.format(m.calls) }}</td>
+        <td class="num">{{ '{:,}'.format(m.input_tokens) }}</td>
+        <td class="num">{{ '{:,}'.format(m.output_tokens) }}</td>
+        <td class="num">{% if m.cost_usd %}${{ '%.3f'|format(m.cost_usd) }}{% else %}<span class="muted">unpriced</span>{% endif %}</td>
+        <td class="barcell">
+          <div class="bar" style="width: {{ ((m.cost_usd / top * 100) if top else 0)|round(1) }}%"></div>
+        </td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h2>By day</h2>
+  <table>
+    <tr><th>Date</th><th class="num">Runs</th><th class="num">Tokens</th><th class="num">Cost</th></tr>
+    {% for day, d in by_day.items() %}
+      <tr>
+        <td>{{ day }}</td>
+        <td class="num">{{ d.runs }}</td>
+        <td class="num">{{ '{:,}'.format(d.total_tokens) }}</td>
+        <td class="num">${{ '%.2f'|format(d.cost_usd) }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Runs</h2>
+  <table>
+    <tr>
+      <th>When</th><th>Article</th><th class="num">Calls</th>
+      <th class="num">Tokens</th><th class="num">Cost</th>
+    </tr>
+    {% for r in runs %}
+      <tr>
+        <td class="muted">{{ r.at[:16].replace('T', ' ') }}</td>
+        <td>{{ r.title or r.slug }}</td>
+        <td class="num">{{ r.calls }}</td>
+        <td class="num">{{ '{:,}'.format(r.total_tokens) }}</td>
+        <td class="num">${{ '%.3f'|format(r.cost_usd) }}{% if not r.fully_priced %}<span class="muted">+</span>{% endif %}</td>
+      </tr>
+    {% endfor %}
+  </table>
+
+{% endif %}
+
+</main>
+</body>
+</html>
