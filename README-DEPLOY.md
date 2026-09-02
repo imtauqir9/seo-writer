@@ -51,6 +51,12 @@ Or set them individually:
 flyctl secrets set ANTHROPIC_API_KEY=sk-ant-... SERPAPI_KEY=...
 ```
 
+Optional, to have OpenAI judge disputes in the Step 6.5 audit instead of Claude:
+```bash
+flyctl secrets set OPENAI_API_KEY=sk-... OPENAI_JUDGE_MODEL=gpt-5
+```
+Without it the judge stays on `claude-opus-5`. Nothing breaks if it is unset.
+
 ## 6. Deploy
 ```bash
 flyctl deploy
@@ -73,5 +79,9 @@ flyctl open        # opens https://<your-app>.fly.dev
   connection open, which keeps the machine awake.
 - **Cost.** One `shared-cpu-1x` / 1 GB machine that sleeps when idle + a 1 GB volume is
   a few dollars a month at most. Claude API usage is billed separately by Anthropic.
+- **Generation is slow now.** With the Step 6.5 audit on, a single article is 12-16 model
+  calls and can run past ten minutes. The SSE stream sends a keepalive comment every 15s so
+  Fly's proxy holds the connection; it only gives up after 15 minutes of true silence.
+  Pass `--no-verify` or lower `--verify-rounds` if you want the old speed.
 - **Logs:** `flyctl logs`   •   **Status:** `flyctl status`   •   **Redeploy:** `flyctl deploy`
 - **Rotate a key:** `flyctl secrets set ANTHROPIC_API_KEY=sk-ant-newvalue` (triggers a restart).

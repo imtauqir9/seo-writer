@@ -49,6 +49,13 @@ def _load_dotenv():
 
 _load_dotenv()
 
+# A single high-effort audit call on a 3,500-word article can run for minutes
+# with nothing to print. Emit a comment frame while waiting so neither the
+# browser nor Fly's edge proxy closes the connection, and only fail on a
+# genuinely dead pipeline.
+HEARTBEAT_SECS = 15
+SILENCE_LIMIT_SECS = 900
+
 # In-memory job store: job_id → queue.Queue
 _jobs: dict[str, queue.Queue] = {}
 _jobs_lock = threading.Lock()
@@ -187,14 +194,27 @@ def api_stream(job_id):
         return jsonify({"error": "job not found"}), 404
 
     def stream():
+        silent = 0
         try:
             while True:
                 try:
-                    kind, msg = q.get(timeout=180)
+                    kind, msg = q.get(timeout=HEARTBEAT_SECS)
                 except queue.Empty:
-                    yield "event: error\ndata: {\"message\": \"Timeout\"}\n\n"
-                    break
+                    silent += HEARTBEAT_SECS
+                    if silent >= SILENCE_LIMIT_SECS:
+                        minutes = SILENCE_LIMIT_SECS // 60
+                        yield (
+                            "event: error\ndata: "
+                            + json.dumps({"message": f"The pipeline stopped "
+                                                     f"responding after {minutes} "
+                                                     f"minutes."})
+                            + "\n\n"
+                        )
+                        break
+                    yield ": keepalive\n\n"
+                    continue
 
+                silent = 0
                 if kind == "log":
                     yield f"event: log\ndata: {json.dumps({'line': msg})}\n\n"
                 elif kind == "done":

@@ -60,6 +60,33 @@ _load_dotenv()
 # ---------------------------------------------------------------------------
 
 MODEL = "claude-sonnet-5"
+
+# The verify/judge stage deliberately does not reuse MODEL at its default effort.
+# The auditor thinks harder than the writer did, and the judge is a different model
+# entirely, so a disagreement is not settled by the same weights that caused it.
+VERIFIER_MODEL = "claude-sonnet-5"
+VERIFIER_EFFORT = "high"
+JUDGE_MODEL = "claude-opus-5"
+JUDGE_EFFORT = "high"
+
+# The judge is the one role where a second vendor genuinely buys something: two
+# Anthropic models can share the blind spot that put the disputed sentence in the
+# article in the first place. Set OPENAI_API_KEY and the judge switches over.
+#   JUDGE_PROVIDER=auto      openai when OPENAI_API_KEY is set, else anthropic
+#   JUDGE_PROVIDER=anthropic force Claude
+#   JUDGE_PROVIDER=openai    force OpenAI (errors if the key is missing)
+JUDGE_PROVIDER = os.getenv("JUDGE_PROVIDER", "auto").strip().lower()
+OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-5.5")
+
+
+def judge_provider() -> str:
+    """Which vendor rules on disputes, after resolving 'auto'."""
+    if JUDGE_PROVIDER == "openai":
+        return "openai"
+    if JUDGE_PROVIDER == "anthropic":
+        return "anthropic"
+    return "openai" if os.getenv("OPENAI_API_KEY") else "anthropic"
+
 SERPAPI_BASE = "https://serpapi.com/search.json"
 UNSPLASH_BASE = "https://unsplash.com/s/photos"
 
@@ -119,17 +146,18 @@ def _api_message(e: "anthropic.APIStatusError") -> str:
     return e.message
 
 
-def call_claude(prompt: str, system: str = "", max_tokens: int = 16000) -> str:
+def call_claude(prompt: str, system: str = "", max_tokens: int = 16000,
+                model: str = MODEL, effort: str = "low") -> str:
     messages = [{"role": "user", "content": prompt}]
     kwargs = {
-        "model": MODEL,
+        "model": model,
         "max_tokens": max_tokens,
         "messages": messages,
         # Sonnet 5 runs adaptive thinking when `thinking` is omitted, so state it
         # explicitly. Low effort keeps the token cost close to the old no-thinking
         # behaviour while still buying Sonnet 5's better planning.
         "thinking": {"type": "adaptive"},
-        "output_config": {"effort": "low"},
+        "output_config": {"effort": effort},
     }
     if system:
         kwargs["system"] = system
@@ -154,7 +182,7 @@ def call_claude(prompt: str, system: str = "", max_tokens: int = 16000) -> str:
         detail = (
             "This usually means the account is out of credits."
             if e.type == "billing_error"
-            else f"The key may lack access to {MODEL}."
+            else f"The key may lack access to {model}."
         )
         raise ClaudeError(
             f"Anthropic denied the request. {detail} ({_api_message(e)})"
@@ -194,6 +222,46 @@ def call_claude(prompt: str, system: str = "", max_tokens: int = 16000) -> str:
             f"Claude returned no text (stop_reason: {response.stop_reason})."
         )
     return text.strip()
+
+
+def call_openai(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
+    """Second-vendor call, used only for judging disputes."""
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise ClaudeError(
+            "JUDGE_PROVIDER is openai but the openai package is not installed. "
+            "Run: pip install openai"
+        ) from e
+
+    if not os.getenv("OPENAI_API_KEY"):
+        raise ClaudeError(
+            "JUDGE_PROVIDER is openai but OPENAI_API_KEY is not set. Add it to .env, "
+            "or set JUDGE_PROVIDER=anthropic to keep the Claude judge."
+        )
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    try:
+        response = OpenAI().chat.completions.create(
+            model=OPENAI_JUDGE_MODEL,
+            messages=messages,
+            max_completion_tokens=max_tokens,
+        )
+    except Exception as e:
+        raise ClaudeError(
+            f"The OpenAI judge failed ({type(e).__name__}: {e}). If the model name is "
+            f"wrong, set OPENAI_JUDGE_MODEL to one your key can reach "
+            f"(currently '{OPENAI_JUDGE_MODEL}'), or set JUDGE_PROVIDER=anthropic."
+        ) from e
+
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise ClaudeError(f"The OpenAI judge returned no text (model: {OPENAI_JUDGE_MODEL}).")
+    return text
 
 
 def extract_json(text: str) -> dict:
@@ -290,6 +358,9 @@ Return ONLY valid JSON, no extra text:
 
     response = call_claude(prompt)
     result = extract_json(response)
+    # Kept so the Step 6.5 auditor can check the article against what actually
+    # ranks, not just against Claude's summary of it.
+    result["serp_context"] = serp_context.strip()
     print("  Research complete.")
     return result
 
@@ -1049,10 +1120,319 @@ def _write_docx(slug: str, branded: str, output_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Step 6.5: Verify -> Rebut -> Judge
+#
+# An independent auditor reads the finished article. Anything it flags goes
+# back to the writer, which may accept the finding or dispute it. Disputes are
+# settled by a third model that sees both sides and rules. Only findings that
+# survive that process are applied.
+# ---------------------------------------------------------------------------
+
+VERIFY_SYSTEM = (
+    "You are an independent editorial auditor. You did not write this article and you "
+    "owe its author nothing. Find what is actually wrong with it: claims stated as fact "
+    "without support, structure that drifted from the brief, AI writing tells that "
+    "survived editing, coverage the brief required and the draft skipped. "
+    "Do not pad the list with nitpicks - a short list of real problems beats a long list "
+    "of style opinions. Report strict JSON only."
+)
+
+WRITER_SYSTEM = (
+    "You are the writer who produced this article. An auditor has raised findings against "
+    "it. Concede the ones that are right - defensiveness costs you nothing here and helps "
+    "no one. Dispute only where the auditor is factually mistaken, misread the article, or "
+    "is asserting a style preference as an error. Report strict JSON only."
+)
+
+JUDGE_SYSTEM = (
+    "You are the deciding editor. An auditor and a writer disagree about specific findings "
+    "on an article. You see the article, the finding, and the writer's response. Rule on "
+    "each one. You are not splitting the difference and you are not deferring to either "
+    "party - decide which reading of the text is correct. Report strict JSON only."
+)
+
+
+def verify_content(article: str, outline: str, key_takeaways: str, research: dict,
+                   round_no: int = 1) -> dict:
+    """Independent audit of the finished article. Returns {verdict, scores, issues}."""
+    log("STEP 6.5", f"Verification pass (round {round_no})")
+
+    kw = research.get("keywords", {})
+    serp_context = research.get("serp_context") or "(no live SERP data was available)"
+
+    prompt = f"""Audit the article below against the brief it was written from.
+
+BRIEF IT WAS WRITTEN FROM
+Primary keyword: {kw.get("primary_keyword", "")}
+Secondary keywords: {", ".join(kw.get("secondary_keywords", []))}
+Search intent: {research.get("search_intent")}
+Target audience: {research.get("target_audience")}
+Article goal: {research.get("article_goal")}
+
+Required takeaways:
+{key_takeaways}
+
+Outline it was told to follow:
+{outline}
+
+What is currently ranking for this keyword:
+{serp_context}
+
+WHAT TO CHECK
+1. FACTUAL - Any claim presented as fact with no citation and no way for a reader to
+   check it. Numbers, dates, prices, version names, and company claims are the highest
+   risk. Flag anything you believe is outdated or wrong, and say why.
+2. CITATIONS - "Source: <url>" lines that do not plausibly support the sentence they
+   follow, or a bare domain used as if it were evidence.
+3. STRUCTURE - Sections in the outline that are missing, merged, or renamed beyond
+   recognition. Count the [IMAGE: ... | Query: ...] markers still present and compare
+   with the outline.
+4. AI TELLS - Patterns that survived editing: significance inflation, vague attribution
+   ("experts say"), participle padding, title case headings, em dashes inside headings,
+   formulaic conclusions.
+5. COVERAGE - Required takeaways that never actually land in the body, or a subtopic the
+   ranking pages all cover and this article does not.
+6. CONTRADICTION - Places where the article states two incompatible things.
+
+ARTICLE
+{article}
+
+Return ONLY valid JSON in exactly this shape:
+{{
+  "verdict": "pass" or "revise",
+  "scores": {{
+    "factual_support": 0-10,
+    "outline_fidelity": 0-10,
+    "human_voice": 0-10,
+    "coverage": 0-10
+  }},
+  "issues": [
+    {{
+      "id": "i1",
+      "category": "factual|citation|structure|ai_tell|coverage|contradiction",
+      "severity": "high|medium|low",
+      "quote": "<the exact phrase or heading from the article, under 15 words>",
+      "problem": "<what is wrong, one sentence>",
+      "fix": "<the specific change you want, one sentence>"
+    }}
+  ]
+}}
+
+Use "pass" only when there is nothing above low severity. Number the ids i1, i2, i3 in
+order. Return at most 12 issues, most severe first."""
+
+    response = call_claude(prompt, system=VERIFY_SYSTEM, max_tokens=8000,
+                           model=VERIFIER_MODEL, effort=VERIFIER_EFFORT)
+    report = extract_json(response)
+
+    issues = report.get("issues", []) or []
+    scores = report.get("scores", {}) or {}
+    if scores:
+        print("  Scores: " + ", ".join(f"{k}={v}" for k, v in scores.items()))
+    counts = {}
+    for issue in issues:
+        sev = issue.get("severity", "low")
+        counts[sev] = counts.get(sev, 0) + 1
+    summary = ", ".join(f"{n} {sev}" for sev, n in counts.items()) or "none"
+    print(f"  Verdict: {report.get('verdict', 'revise')} ({summary})")
+    for issue in issues:
+        print(f"    [{issue.get('severity','?')}] {issue.get('id','?')} "
+              f"{issue.get('category','?')}: {issue.get('problem','')[:110]}")
+    return report
+
+
+def writer_rebuttal(article: str, issues: list) -> dict:
+    """Give the writer a right of reply. Returns {responses: [{id, stance, reason}]}."""
+    log("STEP 6.5", f"Writer responding to {len(issues)} finding(s)")
+
+    issue_block = json.dumps(
+        [{k: i.get(k) for k in ("id", "category", "severity", "quote", "problem", "fix")}
+         for i in issues],
+        indent=2,
+    )
+
+    prompt = f"""An auditor raised these findings against your article.
+
+FINDINGS
+{issue_block}
+
+YOUR ARTICLE
+{article}
+
+For each finding, decide:
+- "accept" - the auditor is right, the change should be made.
+- "dispute" - the auditor is wrong. Only use this when you can point to something concrete:
+  the quoted text does not say what the auditor claims, the claim IS cited elsewhere in the
+  article, the structure change was required by the brief, or the auditor is calling a
+  deliberate stylistic choice an error.
+
+A dispute with no concrete reason will be overruled, so do not dispute to save face.
+
+Return ONLY valid JSON:
+{{
+  "responses": [
+    {{"id": "i1", "stance": "accept" or "dispute", "reason": "<one sentence>"}}
+  ]
+}}
+
+Include exactly one response per finding id."""
+
+    response = call_claude(prompt, system=WRITER_SYSTEM, max_tokens=4000)
+    result = extract_json(response)
+
+    responses = result.get("responses", []) or []
+    n_disputed = sum(1 for r in responses if r.get("stance") == "dispute")
+    print(f"  Writer accepted {len(responses) - n_disputed}, disputed {n_disputed}.")
+    for r in responses:
+        if r.get("stance") == "dispute":
+            print(f"    disputes {r.get('id')}: {r.get('reason','')[:110]}")
+    return result
+
+
+def judge_disputes(article: str, disputes: list) -> dict:
+    """Settle contested findings with a third model. Returns {rulings: [...]}."""
+    provider = judge_provider()
+    judge_name = OPENAI_JUDGE_MODEL if provider == "openai" else JUDGE_MODEL
+    log("STEP 6.5", f"Escalating {len(disputes)} dispute(s) to judge ({judge_name})")
+
+    case_block = json.dumps(disputes, indent=2)
+
+    prompt = f"""An auditor and the writer disagree about the findings below. Rule on each.
+
+CONTESTED FINDINGS
+Each entry has the auditor's finding and the writer's reason for disputing it.
+{case_block}
+
+THE ARTICLE IN FULL
+{article}
+
+For each finding, read the article text yourself and decide who is right:
+- "uphold" - the auditor's finding stands and the fix should be applied.
+- "overrule" - the writer is right and the article should be left alone.
+
+Judge the substance, not the confidence of either side. If the disputed text is a matter
+of taste rather than accuracy or structure, overrule. If the writer's reason does not
+survive a look at the actual text, uphold.
+
+Return ONLY valid JSON:
+{{
+  "rulings": [
+    {{"id": "i1", "ruling": "uphold" or "overrule", "reasoning": "<one sentence>"}}
+  ]
+}}
+
+Include exactly one ruling per contested finding."""
+
+    response = None
+    if provider == "openai":
+        try:
+            response = call_openai(prompt, system=JUDGE_SYSTEM, max_tokens=4000)
+        except ClaudeError as e:
+            # A judge outage must not destroy an article that already cost a dozen
+            # calls to produce. Fall back to the Claude judge and keep going.
+            reason = " ".join(str(e).split())[:160]
+            print(f"  OpenAI judge unavailable, falling back to {JUDGE_MODEL}.")
+            print(f"    {reason}")
+
+    if response is None:
+        response = call_claude(prompt, system=JUDGE_SYSTEM, max_tokens=4000,
+                               model=JUDGE_MODEL, effort=JUDGE_EFFORT)
+    result = extract_json(response)
+
+    for r in result.get("rulings", []) or []:
+        print(f"    {r.get('ruling','?').upper():8} {r.get('id','?')}: "
+              f"{r.get('reasoning','')[:110]}")
+    return result
+
+
+def apply_fixes(article: str, upheld: list) -> str:
+    """Rewrite the article to address only the findings that survived."""
+    log("STEP 6.5", f"Applying {len(upheld)} upheld finding(s)")
+
+    fix_block = "\n".join(
+        f"- [{i.get('severity','?')}] {i.get('quote','')}\n"
+        f"  Problem: {i.get('problem','')}\n"
+        f"  Fix: {i.get('fix','')}"
+        for i in upheld
+    )
+
+    prompt = f"""Revise the article to address the findings below. Change nothing else.
+
+FINDINGS TO ADDRESS
+{fix_block}
+
+STRUCTURAL CONSTRAINTS (never break these):
+- Preserve ALL markdown headings unless a finding explicitly asks you to change one
+- Preserve ALL [IMAGE: alt text | Query: ...] markers exactly
+- Preserve ALL "Source: ..." citations except where a finding says one is wrong
+- Keep paragraphs to 3-4 sentences
+- Do NOT rewrite passages no finding mentions
+- Do NOT invent a citation. If a finding says a claim is unsupported and you have no real
+  source, soften the claim or cut it instead of attaching a made-up URL.
+
+ARTICLE
+{article}
+
+Return ONLY the revised article. No preamble, no list of what you changed."""
+
+    revised = call_claude(prompt, max_tokens=16000)
+    revised = _strip_em_dashes(revised)
+    print(f"  Revised ({len(revised.split())} words).")
+    return revised
+
+
+def verification_loop(article: str, outline: str, key_takeaways: str, research: dict,
+                      max_rounds: int = 2) -> str:
+    """Audit, argue, judge, fix - up to max_rounds times or until the audit passes."""
+    for round_no in range(1, max_rounds + 1):
+        report = verify_content(article, outline, key_takeaways, research, round_no)
+        issues = report.get("issues", []) or []
+
+        if report.get("verdict") == "pass" or not issues:
+            print(f"  Verification passed on round {round_no}. No changes applied.")
+            return article
+
+        by_id = {i.get("id"): i for i in issues if i.get("id")}
+        rebuttal = writer_rebuttal(article, issues)
+
+        upheld, disputed = [], []
+        answered = set()
+        for r in rebuttal.get("responses", []) or []:
+            issue = by_id.get(r.get("id"))
+            if not issue:
+                continue
+            answered.add(r.get("id"))
+            if r.get("stance") == "dispute":
+                disputed.append({**issue, "writer_reason": r.get("reason", "")})
+            else:
+                upheld.append(issue)
+        # A finding the writer never answered is not a dispute - apply it.
+        upheld += [i for k, i in by_id.items() if k not in answered]
+
+        if disputed:
+            rulings = judge_disputes(article, disputed)
+            ruled = {r.get("id"): r.get("ruling") for r in rulings.get("rulings", []) or []}
+            for issue in disputed:
+                # An unruled dispute defaults to the writer keeping the text.
+                if ruled.get(issue.get("id")) == "uphold":
+                    upheld.append(issue)
+
+        if not upheld:
+            print("  Every finding was overruled. Article left as written.")
+            return article
+
+        article = apply_fixes(article, upheld)
+
+    print(f"  Reached the {max_rounds}-round limit. Using the latest revision.")
+    return article
+
+
+# ---------------------------------------------------------------------------
 # Main Pipeline
 # ---------------------------------------------------------------------------
 
-def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: str = ""):
+def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: str = "",
+        verify: bool = True, verify_rounds: int = 2):
     # If intent is given and no explicit keywords, derive optimized search keywords
     if intent and not keywords:
         log("INTENT", "Extracting search keywords from intent...")
@@ -1087,6 +1467,14 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
 
     # Step 6: Humanize
     humanized = humanize_content(content)
+
+    # Step 6.5: Verify -> rebut -> judge -> fix
+    if verify:
+        humanized = verification_loop(
+            humanized, outline, key_takeaways, research, max_rounds=verify_rounds
+        )
+    else:
+        log("STEP 6.5", "Verification skipped (--no-verify)")
 
     # Step 7: Meta
     meta = generate_meta(refined_title, keywords, humanized)
@@ -1152,6 +1540,20 @@ def main():
         default=0,
         help="Newsletter edition number shown in the author intro (e.g. --edition 31)",
     )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help=(
+            "Skip the Step 6.5 audit. Faster and cheaper, but nothing checks the "
+            "article's claims or structure before it is written to disk."
+        ),
+    )
+    parser.add_argument(
+        "--verify-rounds",
+        type=int,
+        default=2,
+        help="Maximum audit/fix rounds before accepting the article (default: 2)",
+    )
     args = parser.parse_args()
 
     if not os.getenv("ANTHROPIC_API_KEY"):
@@ -1164,7 +1566,15 @@ def main():
     output_dir = Path(args.output_dir)
 
     try:
-        run(title=args.topic, keywords=keywords, output_dir=output_dir, edition=args.edition, intent=intent)
+        run(
+            title=args.topic,
+            keywords=keywords,
+            output_dir=output_dir,
+            edition=args.edition,
+            intent=intent,
+            verify=not args.no_verify,
+            verify_rounds=args.verify_rounds,
+        )
     except ClaudeError as e:
         # Flattened to one line so the web UI, which reads the log line by line,
         # can surface the whole message as a single error.
