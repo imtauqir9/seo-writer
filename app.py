@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -400,17 +400,27 @@ def _spawn(cmd: list[str], review_baseline: set | None = None) -> str:
                 env={**os.environ},
             )
             last_error = ""
+            tail = deque(maxlen=40)
             for line in proc.stdout:
                 line = line.rstrip()
                 # seo_writer.py prefixes fatal, already-human-readable failures
                 # with "ERROR:" — prefer that over a bare exit code.
                 if line.startswith("ERROR:"):
                     last_error = line[len("ERROR:"):].strip()
+                tail.append(line)
                 q.put(("log", line))
             proc.wait()
             if proc.returncode != 0:
+                # The child's output only ever went to the browser, so a crash
+                # vanished when the tab closed and the server log showed nothing.
+                # Echo the tail so it survives in `flyctl logs`.
+                print(f"[job] pipeline exited {proc.returncode}; last output:",
+                      flush=True)
+                for line in tail:
+                    print(f"[job]   {line}", flush=True)
                 q.put(("error", last_error
-                       or f"Pipeline exited with code {proc.returncode}"))
+                       or f"Pipeline exited with code {proc.returncode}. "
+                          f"The server log has the last 40 lines."))
                 return
 
             payload = {}

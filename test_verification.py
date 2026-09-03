@@ -497,6 +497,74 @@ def test_review_files_are_written():
         assert reloaded["rounds"][0]["applied"] == ["i1"], reloaded["rounds"][0]
 
 
+# --- parsing what three different vendors call JSON -------------------------
+#
+# Eight call sites depend on extract_json, and a ValueError escaping it crashed
+# the pipeline with a bare traceback - which the web UI could only report as
+# "exited with code 1".
+
+FENCE = "```"
+
+
+def test_plain_json_object():
+    assert sw.extract_json('{"verdict": "pass"}') == {"verdict": "pass"}
+
+
+def test_fenced_json_block():
+    text = FENCE + 'json\n{"verdict": "pass", "issues": []}\n' + FENCE
+    assert sw.extract_json(text) == {"verdict": "pass", "issues": []}
+
+
+def test_unlabelled_fence():
+    text = FENCE + '\n{"a": 1}\n' + FENCE
+    assert sw.extract_json(text) == {"a": 1}
+
+
+def test_preamble_before_the_object():
+    text = 'Here is my audit:\n\n{"verdict": "revise", "issues": [{"id": "i1"}]}'
+    assert sw.extract_json(text)["verdict"] == "revise"
+
+
+def test_trailing_chatter_containing_braces():
+    # The greedy pattern would swallow the closing brace of the sign-off.
+    text = '{"verdict": "pass"}\n\nLet me know if you need anything {else}!'
+    assert sw.extract_json(text) == {"verdict": "pass"}
+
+
+def test_nested_objects_survive():
+    text = '{"scores": {"factual_support": 8}, "issues": []}'
+    assert sw.extract_json(text)["scores"]["factual_support"] == 8
+
+
+def test_prose_raises_a_readable_error_not_a_traceback():
+    try:
+        sw.extract_json("I am not able to audit this article.")
+    except sw.ClaudeError as e:
+        assert "not JSON" in str(e)
+        assert "I am not able" in str(e), str(e)
+    else:
+        raise AssertionError("prose should not parse")
+
+
+def test_empty_response_raises_claude_error():
+    try:
+        sw.extract_json("")
+    except sw.ClaudeError as e:
+        assert "empty" in str(e)
+    else:
+        raise AssertionError("an empty response should not parse")
+
+
+def test_a_json_list_is_not_accepted_as_an_object():
+    # Callers all do .get() on the result; a list would fail far from here.
+    try:
+        sw.extract_json("[1, 2, 3]")
+    except sw.ClaudeError:
+        pass
+    else:
+        raise AssertionError("a list should not satisfy extract_json")
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

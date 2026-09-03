@@ -560,11 +560,42 @@ def call_agent(role: dict, prompt: str, system: str = "", max_tokens: int = 4000
 
 
 def extract_json(text: str) -> dict:
-    """Extract first JSON object from a string."""
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        raise ValueError(f"No JSON found in response:\n{text[:300]}")
-    return json.loads(match.group())
+    """Pull a JSON object out of a model response.
+
+    Eight call sites depend on this, and the responses now come from three
+    vendors with different habits: fenced blocks, a sentence of preamble, a
+    trailing note. A ValueError escaping here used to crash the pipeline with a
+    bare traceback, so every failure now raises ClaudeError carrying the text
+    that could not be parsed.
+    """
+    raw = (text or "").strip()
+
+    # ```json ... ``` fences, which some models add and others never do.
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", raw, re.DOTALL)
+    candidates = [fenced.group(1).strip()] if fenced else []
+    candidates.append(raw)
+
+    # Greedy: the outermost braces. Non-greedy: the first complete-looking
+    # object, which survives a trailing "Let me know if..." with a brace in it.
+    for pattern in (r"\{.*\}", r"\{.*?\}"):
+        for source in list(candidates):
+            match = re.search(pattern, source, re.DOTALL)
+            if match:
+                candidates.append(match.group())
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    preview = " ".join(raw.split())[:300] or "(the response was empty)"
+    raise ClaudeError(
+        f"A model returned something that is not JSON, where JSON was required. "
+        f"This usually means the model answered in prose. It said: {preview}"
+    )
 
 
 def log(step: str, msg: str = ""):
@@ -2668,6 +2699,19 @@ def main():
         # can surface the whole message as a single error.
         print(f"ERROR: {' '.join(str(e).split())}", file=sys.stderr)
         sys.exit(2)
+    except KeyboardInterrupt:
+        print("ERROR: Interrupted.", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        # Anything unhandled used to leave the web UI showing "exited with code
+        # 1" and nothing else, because a raw traceback carries no ERROR: line
+        # for the job runner to pick up. Print both: a one-line summary it can
+        # surface, and the traceback underneath for whoever reads the log.
+        import traceback
+        print(f"ERROR: {type(e).__name__}: {' '.join(str(e).split())[:300]}",
+              file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
