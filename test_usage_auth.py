@@ -381,6 +381,160 @@ def test_usage_api_returns_rollup_and_runs():
         assert "by_model" in data and "by_day" in data
 
 
+# --- evaluating a draft from the browser -----------------------------------
+
+REVIEW_RECORD = {
+    "agents": {"writer": {"model": "claude-sonnet-5", "provider": "anthropic"},
+               "auditor": {"model": "gpt-5.5", "provider": "openai"},
+               "judge": {"model": "claude-opus-5", "provider": "anthropic"}},
+    "outcome": "passed on round 2",
+    "rounds": [{
+        "round": 1, "verdict": "revise", "scores": {"factual_support": 6},
+        "issues": [
+            {"id": "i1", "category": "factual", "severity": "high",
+             "quote": "cuts p99 latency by 40%", "problem": "No citation.",
+             "fix": "Attribute it or cut it."},
+            {"id": "i2", "category": "ai_tell", "severity": "low",
+             "quote": "a pivotal moment", "problem": "Inflation.", "fix": "Cut it."},
+        ],
+        "responses": [{"id": "i1", "stance": "dispute", "reason": "cited below"}],
+        "rulings": [{"id": "i1", "ruling": "uphold", "reasoning": "different claim"}],
+        "applied": ["i1", "i2"],
+    }],
+}
+
+
+def with_review(tmp, slug="demo"):
+    m = make_app(tmp)
+    (sw.Path(tmp) / f"{slug}_review.json").write_text(
+        json.dumps(REVIEW_RECORD), encoding="utf-8")
+    return m
+
+
+def test_audit_needs_something_to_audit():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().post("/api/audit/start", data={})
+        assert r.status_code == 400, r.status_code
+        assert "Paste an article" in r.get_json()["error"]
+
+
+def test_audit_rejects_a_draft_too_short_to_be_worth_the_calls():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().post("/api/audit/start", data={"text": "far too short"})
+        assert r.status_code == 400
+        assert "too short" in r.get_json()["error"]
+
+
+def test_audit_rejects_file_types_it_cannot_read():
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().post(
+            "/api/audit/start",
+            data={"file": (io.BytesIO(b"binary"), "payload.exe")},
+            content_type="multipart/form-data")
+        assert r.status_code == 400
+        assert ".exe is not supported" in r.get_json()["error"], r.get_json()
+
+
+def test_audit_rejects_a_file_that_is_not_utf8():
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().post(
+            "/api/audit/start",
+            data={"file": (io.BytesIO(b"\xff\xfe\x00binary"), "draft.md")},
+            content_type="multipart/form-data")
+        assert r.status_code == 400
+        assert "not UTF-8" in r.get_json()["error"], r.get_json()
+
+
+def test_audit_is_behind_the_password_like_everything_else():
+    # It spends money, so it must never be open.
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d, password="s3cret")
+        r = m.app.test_client().post("/api/audit/start", data={"text": "x " * 100})
+        assert r.status_code == 401, r.status_code
+
+
+def test_review_page_shows_all_three_voices():
+    with tempfile.TemporaryDirectory() as d:
+        m = with_review(d)
+        body = m.app.test_client().get("/review/demo").data.decode()
+        assert "cuts p99 latency by 40%" in body        # the quoted text
+        assert "gpt-5.5" in body                        # the roster
+        assert "disputed" in body                       # the writer
+        assert "uphold" in body                         # the judge
+        assert "did not respond" in body                # i2, never answered
+        assert "passed on round 2" in body              # the outcome
+
+
+def test_review_counts_are_computed_not_guessed():
+    with tempfile.TemporaryDirectory() as d:
+        m = with_review(d)
+        body = m.app.test_client().get("/review/demo").data.decode()
+        assert "<b>2</b> raised" in body, body[body.find("counts"):][:300]
+        assert "<b>1</b> disputed" in body
+        assert "<b>2</b> applied" in body
+
+
+def test_missing_review_is_a_404_not_a_crash():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().get("/review/nothing-here")
+        assert r.status_code == 404
+        assert b"No review found" in r.data
+
+
+def test_review_slug_cannot_escape_the_output_directory():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().get("/review/..%2f..%2fetc%2fpasswd")
+        assert r.status_code == 404, r.status_code
+
+
+def test_reviews_are_listed_with_their_headline_numbers():
+    with tempfile.TemporaryDirectory() as d:
+        m = with_review(d)
+        rows = m.app.test_client().get("/api/reviews").get_json()
+        assert len(rows) == 1, rows
+        assert rows[0]["slug"] == "demo"
+        assert rows[0]["raised"] == 2 and rows[0]["applied"] == 2
+        assert rows[0]["agents"]["auditor"] == "gpt-5.5"
+
+
+def test_the_page_offers_both_modes():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        body = m.app.test_client().get("/").data.decode()
+        assert "Evaluate a draft" in body
+        assert "Generate New Article" in body
+
+
+def test_docx_headings_survive_the_conversion():
+    try:
+        from docx import Document
+    except ImportError:
+        return                      # python-docx absent; nothing to check
+    import io
+    with tempfile.TemporaryDirectory() as d:
+        make_app(d)
+        doc = Document()
+        doc.add_heading("The Title", level=1)
+        doc.add_paragraph("Some body text.")
+        doc.add_heading("A Section", level=2)
+        doc.add_paragraph("More body text.")
+        buf = io.BytesIO()
+        doc.save(buf)
+        import app as m
+        md = m._docx_to_markdown(buf.getvalue())
+        assert "# The Title" in md, md
+        assert "## A Section" in md, md
+        assert "Some body text." in md
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

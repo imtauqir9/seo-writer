@@ -44,6 +44,29 @@
 
   .panel-form h2 { font-size: 1rem; font-weight: 700; color: #111; }
 
+  /* Mode switch: write a new article, or evaluate one you already have */
+  .tabs { display: flex; gap: 0; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; }
+  .tabs button {
+    flex: 1; padding: 9px 8px; font-family: inherit; font-size: 0.82rem; font-weight: 600;
+    background: #fafafa; color: #666; border: none; cursor: pointer; transition: background 0.12s, color 0.12s;
+  }
+  .tabs button + button { border-left: 1px solid #ddd; }
+  .tabs button.active { background: #111; color: #fff; }
+  .mode { display: none; flex-direction: column; gap: 20px; }
+  .mode.active { display: flex; }
+
+  .filedrop {
+    border: 1px dashed #ccc; border-radius: 6px; padding: 14px; text-align: center;
+    font-size: 0.8rem; color: #888; background: #fafafa; cursor: pointer;
+  }
+  .filedrop:hover { border-color: #111; color: #555; }
+  .filedrop input { display: none; }
+  .filedrop.has-file { border-style: solid; border-color: #1a7a45; color: #1a7a45; background: #f2fbf6; }
+
+  .checkline { display: flex; align-items: center; gap: 7px; font-size: 0.82rem; color: #555; }
+  .checkline input { margin: 0; }
+  .checkline label { margin: 0; text-transform: none; letter-spacing: 0; font-size: 0.82rem; font-weight: 400; color: #555; }
+
   label { display: block; font-size: 0.8rem; font-weight: 600; color: #555; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.4px; }
 
   input[type="text"],
@@ -233,6 +256,62 @@
 
   <!-- LEFT: Generate form -->
   <aside class="panel-form">
+    <div class="tabs">
+      <button type="button" id="tabWrite" class="active">Write new</button>
+      <button type="button" id="tabAudit">Evaluate a draft</button>
+    </div>
+
+    <!-- MODE: evaluate an existing document -->
+    <div class="mode" id="modeAudit">
+      <h2>Evaluate a Draft</h2>
+      <p class="hint" style="margin-top:-12px">
+        Three agents argue about a document you already have. The auditor attacks it,
+        the writer answers back, a judge settles what stays contested. No article,
+        images or meta are generated.
+      </p>
+
+      <form id="auditForm">
+        <label class="filedrop" id="fileDrop" for="auditFile">
+          <input type="file" id="auditFile" accept=".md,.markdown,.txt,.docx">
+          <span id="fileLabel">Choose a .md, .txt or .docx file</span>
+        </label>
+
+        <div style="margin-top:14px">
+          <label for="auditText">…or paste the article</label>
+          <textarea id="auditText" style="min-height:150px"
+                    placeholder="Paste the full draft here. Anything under 50 words is too short to audit meaningfully."></textarea>
+        </div>
+
+        <div style="margin-top:14px">
+          <label for="auditTopic">Topic (optional)</label>
+          <input type="text" id="auditTopic" placeholder="Names the report and its filenames">
+        </div>
+
+        <div style="margin-top:14px">
+          <label for="auditIntent">What were you going for? (optional)</label>
+          <textarea id="auditIntent" style="min-height:70px"
+                    placeholder="e.g. convince platform engineers this is worth the infra cost"></textarea>
+          <p class="hint">A document has no brief, so one call reconstructs the brief it
+            appears to be written to. This sharpens that, and the coverage findings with it.</p>
+        </div>
+
+        <div class="row-2" style="margin-top:14px">
+          <div class="checkline" style="align-self:end;padding-bottom:9px">
+            <input type="checkbox" id="auditApply">
+            <label for="auditApply">Also save a corrected version</label>
+          </div>
+          <div>
+            <label for="auditRounds">Rounds</label>
+            <input type="number" id="auditRounds" value="2" min="1" max="4">
+          </div>
+        </div>
+
+        <button type="submit" id="auditBtn" style="margin-top:16px">Run the Audit</button>
+      </form>
+    </div>
+
+    <!-- MODE: write a new article -->
+    <div class="mode active" id="modeWrite">
     <h2>Generate New Article</h2>
 
     <form id="genForm">
@@ -261,6 +340,7 @@
 
       <button type="submit" id="submitBtn">Generate Article</button>
     </form>
+    </div><!-- /modeWrite -->
 
     <div class="progress-box" id="progressBox">
       <div class="progress-label">Pipeline Output</div>
@@ -360,6 +440,140 @@ function resetSubmit() {
   submitBtn.textContent = 'Generate Article';
 }
 
+/* ---- mode switch ---------------------------------------------------- */
+const tabWrite = document.getElementById('tabWrite');
+const tabAudit = document.getElementById('tabAudit');
+const modeWrite = document.getElementById('modeWrite');
+const modeAudit = document.getElementById('modeAudit');
+
+function setMode(audit) {
+  tabAudit.classList.toggle('active', audit);
+  tabWrite.classList.toggle('active', !audit);
+  modeAudit.classList.toggle('active', audit);
+  modeWrite.classList.toggle('active', !audit);
+}
+tabWrite.addEventListener('click', () => setMode(false));
+tabAudit.addEventListener('click', () => setMode(true));
+
+/* ---- shared job streaming ------------------------------------------- */
+// Both modes run the same pipeline script and want the same live log, so the
+// EventSource handling is written once.
+function streamJob(jobId, { onDone, onFail }) {
+  const es = new EventSource(`/api/stream/${jobId}`);
+
+  es.addEventListener('log', (e) => {
+    try { appendLog(JSON.parse(e.data).line); } catch { appendLog(e.data); }
+  });
+
+  es.addEventListener('done', async (e) => {
+    es.close();
+    let payload = {};
+    try { payload = JSON.parse(e.data) || {}; } catch {}
+    await onDone(payload);
+  });
+
+  es.addEventListener('error', async (e) => {
+    es.close();
+    let msg = 'Pipeline error';
+    try { msg = JSON.parse(e.data).message; } catch {}
+    await onFail(msg);
+  });
+
+  es.onerror = async () => {
+    if (es.readyState === EventSource.CLOSED) await onFail(null);
+  };
+}
+
+function startProgress(header) {
+  logOutput.innerHTML = '';
+  statusBadge.className = 'status-badge';
+  statusBadge.textContent = '';
+  progressBox.classList.add('visible');
+  header.forEach(line => appendLog(line));
+}
+
+/* ---- evaluate an existing draft -------------------------------------- */
+const auditForm = document.getElementById('auditForm');
+const auditBtn = document.getElementById('auditBtn');
+const auditFile = document.getElementById('auditFile');
+const fileDrop = document.getElementById('fileDrop');
+const fileLabel = document.getElementById('fileLabel');
+
+auditFile.addEventListener('change', () => {
+  const f = auditFile.files[0];
+  fileDrop.classList.toggle('has-file', !!f);
+  fileLabel.textContent = f ? f.name : 'Choose a .md, .txt or .docx file';
+});
+
+function resetAudit() {
+  auditBtn.disabled = false;
+  auditBtn.textContent = 'Run the Audit';
+}
+
+auditForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+
+  const text = document.getElementById('auditText').value.trim();
+  const file = auditFile.files[0];
+  if (!text && !file) {
+    statusBadge.className = 'status-badge error';
+    statusBadge.textContent = 'Paste an article or choose a file first.';
+    progressBox.classList.add('visible');
+    return;
+  }
+
+  const body = new FormData();
+  if (file) body.append('file', file); else body.append('text', text);
+  body.append('topic', document.getElementById('auditTopic').value.trim());
+  body.append('intent', document.getElementById('auditIntent').value.trim());
+  body.append('rounds', document.getElementById('auditRounds').value || '2');
+  if (document.getElementById('auditApply').checked) body.append('apply', '1');
+
+  auditBtn.disabled = true;
+  auditBtn.textContent = 'Auditing…';
+  startProgress([
+    file ? `File   : ${file.name}` : `Pasted : ${text.split(/\s+/).length} words`,
+    'Starting the audit…\n',
+  ]);
+
+  let jobId;
+  try {
+    const resp = await fetch('/api/audit/start', { method: 'POST', body });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    jobId = data.job_id;
+  } catch (err) {
+    appendLog(`\nFailed to start: ${err.message}`, 'err');
+    statusBadge.className = 'status-badge error';
+    statusBadge.textContent = err.message;
+    resetAudit();
+    return;
+  }
+
+  streamJob(jobId, {
+    onDone: async (payload) => {
+      appendLog('\nAudit complete.', 'done');
+      statusBadge.className = 'status-badge success';
+      if (payload.review_slug) {
+        statusBadge.innerHTML =
+          `Audit complete. <a href="/review/${encodeURIComponent(payload.review_slug)}">Read the review &rarr;</a>`;
+        window.open(`/review/${encodeURIComponent(payload.review_slug)}`, '_blank');
+      } else {
+        statusBadge.textContent = 'Audit complete, but no review file was produced.';
+      }
+      resetAudit();
+    },
+    onFail: async (msg) => {
+      if (msg) {
+        appendLog(`\nERROR: ${msg}`, 'err');
+        statusBadge.className = 'status-badge error';
+        statusBadge.textContent = msg;
+      }
+      resetAudit();
+    },
+  });
+});
+
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
 
@@ -370,17 +584,13 @@ form.addEventListener('submit', async (e) => {
 
   if (!topic) return;
 
-  // Reset UI
-  logOutput.innerHTML = '';
-  statusBadge.className = 'status-badge';
-  statusBadge.textContent = '';
-  progressBox.classList.add('visible');
   submitBtn.disabled = true;
   submitBtn.textContent = 'Generating…';
-
-  appendLog(`Topic  : ${topic}`);
-  if (intent) appendLog(`Intent : ${intent}`);
-  appendLog('Starting pipeline…\n');
+  startProgress([
+    `Topic  : ${topic}`,
+    ...(intent ? [`Intent : ${intent}`] : []),
+    'Starting pipeline…\n',
+  ]);
 
   // Step 1: POST to start job, get job_id
   let jobId;
@@ -402,40 +612,25 @@ form.addEventListener('submit', async (e) => {
   }
 
   // Step 2: EventSource to stream progress
-  const es = new EventSource(`/api/stream/${jobId}`);
-
-  es.addEventListener('log', (e) => {
-    try { appendLog(JSON.parse(e.data).line); } catch { appendLog(e.data); }
-  });
-
-  es.addEventListener('done', async () => {
-    es.close();
-    appendLog('\nDone!', 'done');
-    statusBadge.className = 'status-badge success';
-    statusBadge.textContent = 'Article generated successfully.';
-    await refreshArticles();
-    resetSubmit();
-  });
-
-  es.addEventListener('error', async (e) => {
-    es.close();
-    let msg = 'Pipeline error';
-    try { msg = JSON.parse(e.data).message; } catch {}
-    appendLog(`\nERROR: ${msg}`, 'err');
-    statusBadge.className = 'status-badge error';
-    statusBadge.textContent = `Error: ${msg}`;
-    // Still refresh in case partial output was written
-    await refreshArticles();
-    resetSubmit();
-  });
-
-  // Fallback: if EventSource itself errors (network issue), recover
-  es.onerror = async () => {
-    if (es.readyState === EventSource.CLOSED) {
+  streamJob(jobId, {
+    onDone: async () => {
+      appendLog('\nDone!', 'done');
+      statusBadge.className = 'status-badge success';
+      statusBadge.textContent = 'Article generated successfully.';
       await refreshArticles();
       resetSubmit();
-    }
-  };
+    },
+    onFail: async (msg) => {
+      if (msg) {
+        appendLog(`\nERROR: ${msg}`, 'err');
+        statusBadge.className = 'status-badge error';
+        statusBadge.textContent = `Error: ${msg}`;
+      }
+      // Still refresh in case partial output was written
+      await refreshArticles();
+      resetSubmit();
+    },
+  });
 });
 </script>
 </body>

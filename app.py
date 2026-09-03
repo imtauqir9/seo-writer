@@ -366,11 +366,6 @@ def api_start():
     if not topic:
         return jsonify({"error": "topic is required"}), 400
 
-    job_id = str(uuid.uuid4())
-    q: queue.Queue = queue.Queue()
-    with _jobs_lock:
-        _jobs[job_id] = q
-
     cmd = [
         sys.executable, str(BASE_DIR / "seo_writer.py"),
         topic,
@@ -379,6 +374,20 @@ def api_start():
     ]
     if intent:
         cmd += ["--intent", intent]
+
+    return jsonify({"job_id": _spawn(cmd)})
+
+
+def _spawn(cmd: list[str], review_baseline: set | None = None) -> str:
+    """Run seo_writer.py in the background, streaming its output to a job queue.
+
+    Shared by generation and audit: both are the same pipeline script with
+    different flags, and both want the same live log.
+    """
+    job_id = str(uuid.uuid4())
+    q: queue.Queue = queue.Queue()
+    with _jobs_lock:
+        _jobs[job_id] = q
 
     def run():
         try:
@@ -399,15 +408,177 @@ def api_start():
                     last_error = line[len("ERROR:"):].strip()
                 q.put(("log", line))
             proc.wait()
-            if proc.returncode == 0:
-                q.put(("done", ""))
-            else:
-                q.put(("error", last_error or f"Pipeline exited with code {proc.returncode}"))
+            if proc.returncode != 0:
+                q.put(("error", last_error
+                       or f"Pipeline exited with code {proc.returncode}"))
+                return
+
+            payload = {}
+            if review_baseline is not None:
+                # Whichever report is new is this job's. Identifying it by
+                # difference beats predicting the slug the pipeline will pick.
+                fresh = [p for p in OUTPUT_DIR.glob("*_review.json")
+                         if p.name not in review_baseline]
+                if fresh:
+                    newest = max(fresh, key=lambda p: p.stat().st_mtime)
+                    payload["review_slug"] = newest.stem[:-len("_review")]
+            q.put(("done", json.dumps(payload)))
         except Exception as e:
             q.put(("error", str(e)))
 
     threading.Thread(target=run, daemon=True).start()
-    return jsonify({"job_id": job_id})
+    return job_id
+
+
+# ---------------------------------------------------------------------------
+# Evaluate a draft you already have
+# ---------------------------------------------------------------------------
+
+UPLOAD_DIR = OUTPUT_DIR / "uploads"
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024          # a 2 MB article is already enormous
+ALLOWED_SUFFIXES = {".md", ".markdown", ".txt", ".docx"}
+
+
+def _docx_to_markdown(raw: bytes) -> str:
+    """Flatten a .docx to text, keeping heading levels so the auditor sees structure."""
+    import io
+    try:
+        from docx import Document
+    except ImportError:
+        raise ValueError("Reading .docx needs python-docx. Paste the text instead.")
+    doc = Document(io.BytesIO(raw))
+    lines = []
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if not text:
+            lines.append("")
+            continue
+        style = (p.style.name or "").lower()
+        if style.startswith("heading"):
+            level = "".join(c for c in style if c.isdigit()) or "2"
+            lines.append("#" * min(int(level), 6) + " " + text)
+        else:
+            lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def _draft_from_request() -> tuple[str, str]:
+    """The document to audit, as (markdown, source name). Raises ValueError."""
+    upload = request.files.get("file")
+    if upload and upload.filename:
+        suffix = Path(upload.filename).suffix.lower()
+        if suffix not in ALLOWED_SUFFIXES:
+            raise ValueError(
+                f"{suffix or 'That file type'} is not supported. "
+                f"Upload {', '.join(sorted(ALLOWED_SUFFIXES))}, or paste the text."
+            )
+        raw = upload.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError("That file is over 2 MB. Trim it or paste the article body.")
+        if suffix == ".docx":
+            return _docx_to_markdown(raw), Path(upload.filename).stem
+        try:
+            return raw.decode("utf-8").strip(), Path(upload.filename).stem
+        except UnicodeDecodeError:
+            raise ValueError("That file is not UTF-8 text. Save it as .md and retry.")
+
+    pasted = (request.form.get("text") or "").strip()
+    if pasted:
+        return pasted, ""
+    raise ValueError("Paste an article or choose a file to evaluate.")
+
+
+@app.route("/api/audit/start", methods=["POST"])
+def api_audit_start():
+    """Run the three agents over a document the user supplied. Returns { job_id }."""
+    try:
+        draft, filename = _draft_from_request()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    if len(draft.split()) < 50:
+        return jsonify({"error": "That draft is too short to audit meaningfully "
+                                 "(under 50 words)."}), 400
+
+    topic = (request.form.get("topic") or "").strip() or filename
+    intent = (request.form.get("intent") or "").strip()
+    try:
+        rounds = max(1, min(int(request.form.get("rounds") or 2), 4))
+    except ValueError:
+        rounds = 2
+    apply_fixes = (request.form.get("apply") or "").lower() in {"1", "true", "on", "yes"}
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    draft_path = UPLOAD_DIR / f"{uuid.uuid4().hex}.md"
+    draft_path.write_text(draft, encoding="utf-8")
+
+    # Snapshot what already exists so the new report can be identified afterwards,
+    # rather than guessing at the slug the pipeline will choose.
+    before = {p.name for p in OUTPUT_DIR.glob("*_review.json")}
+
+    cmd = [
+        sys.executable, str(BASE_DIR / "seo_writer.py"),
+        "--audit", str(draft_path),
+        "--output-dir", str(OUTPUT_DIR),
+        "--verify-rounds", str(rounds),
+    ]
+    if topic:
+        cmd.append(topic)
+    if intent:
+        cmd += ["--intent", intent]
+    if apply_fixes:
+        cmd.append("--apply")
+
+    return jsonify({"job_id": _spawn(cmd, review_baseline=before)})
+
+
+@app.route("/api/reviews")
+def api_reviews():
+    return jsonify(list_reviews())
+
+
+def list_reviews() -> list[dict]:
+    """Every verification report on disk, newest first."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    out = []
+    for path in sorted(OUTPUT_DIR.glob("*_review.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True):
+        slug = path.stem[:-len("_review")]
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rounds = record.get("rounds") or []
+        raised = sum(len(r.get("issues") or []) for r in rounds)
+        applied = sum(len(r.get("applied") or []) for r in rounds)
+        out.append({
+            "slug": slug,
+            "outcome": record.get("outcome", ""),
+            "rounds": len(rounds),
+            "raised": raised,
+            "applied": applied,
+            "at": record.get("finished_at") or record.get("started_at") or "",
+            "agents": {k: v.get("model") for k, v in (record.get("agents") or {}).items()},
+        })
+    return out
+
+
+@app.route("/review/<slug>")
+def review_page(slug):
+    path = OUTPUT_DIR / f"{Path(slug).name}_review.json"
+    if not path.exists():
+        return render_template("review.html", record=None, slug=slug), 404
+    record = json.loads(path.read_text(encoding="utf-8"))
+    rounds = record.get("rounds") or []
+    counts = {
+        "rounds": len(rounds),
+        "raised": sum(len(r.get("issues") or []) for r in rounds),
+        "applied": sum(len(r.get("applied") or []) for r in rounds),
+        "disputed": sum(1 for r in rounds
+                        for x in (r.get("responses") or [])
+                        if x.get("stance") == "dispute"),
+    }
+    return render_template("review.html", record=record, slug=slug, counts=counts)
 
 
 @app.route("/api/stream/<job_id>")
@@ -443,7 +614,7 @@ def api_stream(job_id):
                 if kind == "log":
                     yield f"event: log\ndata: {json.dumps({'line': msg})}\n\n"
                 elif kind == "done":
-                    yield f"event: done\ndata: {{}}\n\n"
+                    yield f"event: done\ndata: {msg or '{}'}\n\n"
                     break
                 elif kind == "error":
                     yield f"event: error\ndata: {json.dumps({'message': msg})}\n\n"

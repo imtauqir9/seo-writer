@@ -248,7 +248,14 @@ Set `SITE_URL` before publishing. Without it the canonical, `og:url` and schema
 ## Auditing your own writing
 
 The three agents don't only work on articles this tool wrote. Point them at any
-markdown file and they'll argue about it:
+document and they'll argue about it.
+
+**In the browser:** open the app, switch to the **Evaluate a draft** tab, and
+either upload a `.md`/`.txt`/`.docx` or paste the article in. The live log runs
+as it does for generation, and the finished report opens as a page showing every
+finding with all three voices on it. Reports stay available at `/review/<slug>`.
+
+**From the CLI:**
 
 ```bash
 # Analyse a document you already have — no article, images or meta are generated

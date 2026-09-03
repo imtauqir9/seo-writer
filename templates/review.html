@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verification review — Humanly</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, sans-serif; background: #f5f5f5; color: #222; min-height: 100vh; }
+
+  header { background: #111; color: #fff; padding: 18px 32px; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 1.2rem; font-weight: 700; letter-spacing: -0.3px; }
+  header span { font-size: 0.85rem; color: #aaa; }
+  header a { color: #aaa; font-size: 0.85rem; text-decoration: none; }
+  header a:hover { color: #fff; }
+  header .spacer { margin-left: auto; }
+
+  main { max-width: 880px; margin: 0 auto; padding: 28px 24px 60px; }
+
+  .roster { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 22px; }
+  .role { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 14px 16px; }
+  .role .who { font-size: 0.7rem; font-weight: 700; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+  .role .model { font-family: Consolas, monospace; font-size: 0.85rem; color: #111; margin-top: 5px; word-break: break-all; }
+  .role .vendor { font-size: 0.72rem; color: #999; margin-top: 2px; }
+
+  .outcome { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 14px 18px; font-size: 0.88rem; margin-bottom: 26px; }
+  .outcome strong { color: #111; }
+  .counts { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 10px; font-size: 0.8rem; color: #666; }
+  .counts b { color: #111; font-variant-numeric: tabular-nums; }
+
+  h2 { font-size: 0.95rem; font-weight: 700; color: #111; margin: 26px 0 12px; }
+
+  .scores { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .score { background: #fff; border: 1px solid #e0e0e0; border-radius: 5px; padding: 8px 12px; font-size: 0.78rem; color: #666; }
+  .score b { display: block; font-size: 1.1rem; color: #111; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+  .finding { background: #fff; border: 1px solid #e0e0e0; border-left-width: 4px; border-radius: 6px; padding: 16px 18px; margin-bottom: 12px; }
+  .finding.high { border-left-color: #c0392b; }
+  .finding.medium { border-left-color: #d68910; }
+  .finding.low { border-left-color: #bbb; }
+
+  .fhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .tag { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; padding: 3px 7px; border-radius: 3px; }
+  .tag.sev-high { background: #fdecea; color: #8a2018; }
+  .tag.sev-medium { background: #fdf3e2; color: #8a5a00; }
+  .tag.sev-low { background: #f0f0f0; color: #666; }
+  .tag.cat { background: #eef2f8; color: #3a5a80; }
+  .tag.applied { background: #e6f9f0; color: #1a7a45; margin-left: auto; }
+  .tag.dropped { background: #f0f0f0; color: #888; margin-left: auto; }
+
+  blockquote { border-left: 3px solid #ddd; padding: 4px 0 4px 12px; margin: 0 0 12px; color: #555; font-size: 0.86rem; font-style: italic; }
+
+  .voice { font-size: 0.86rem; line-height: 1.55; margin-bottom: 7px; }
+  .voice .who { font-weight: 700; color: #111; }
+  .voice.auditor .who { color: #8a2018; }
+  .voice.writer .who { color: #1a6fc4; }
+  .voice.judge .who { color: #6b3fa0; }
+  .voice .wants { color: #666; }
+
+  .empty { background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 40px; text-align: center; color: #888; }
+  .pass { background: #e6f9f0; border: 1px solid #b2dfce; color: #1a7a45; border-radius: 6px; padding: 14px 18px; font-size: 0.88rem; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Verification review</h1>
+  <span>{{ slug }}</span>
+  <span class="spacer"></span>
+  <a href="/">&larr; Back</a>
+  <a href="/output/{{ slug }}_review.md" target="_blank" style="margin-left:18px;">Markdown</a>
+  <a href="/output/{{ slug }}_review.json" target="_blank" style="margin-left:18px;">JSON</a>
+  <a href="/logout" style="margin-left:18px;">Sign out</a>
+</header>
+
+<main>
+
+{% if not record %}
+  <div class="empty">No review found for <code>{{ slug }}</code>.</div>
+{% else %}
+
+  <div class="roster">
+    {% for role, a in (record.agents or {}).items() %}
+      <div class="role">
+        <div class="who">{{ role }}</div>
+        <div class="model">{{ a.model }}</div>
+        <div class="vendor">{{ a.provider }}</div>
+      </div>
+    {% endfor %}
+  </div>
+
+  {% set rounds = record.rounds or [] %}
+  <div class="outcome">
+    Outcome: <strong>{{ record.outcome or 'unknown' }}</strong>
+    <div class="counts">
+      <span><b>{{ counts.rounds }}</b> round{{ '' if counts.rounds == 1 else 's' }}</span>
+      <span><b>{{ counts.raised }}</b> raised</span>
+      <span><b>{{ counts.disputed }}</b> disputed</span>
+      <span><b>{{ counts.applied }}</b> applied</span>
+    </div>
+  </div>
+
+  {% for entry in rounds %}
+    <h2>Round {{ entry.round }} — verdict: {{ entry.verdict or '?' }}</h2>
+
+    {% if entry.scores %}
+      <div class="scores">
+        {% for k, v in entry.scores.items() %}
+          <div class="score">{{ k.replace('_', ' ') }}<b>{{ v }}</b></div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    {% if not entry.issues %}
+      <div class="pass">Nothing found in this round.</div>
+    {% endif %}
+
+    {% set stances = {} %}{% set reasons = {} %}
+    {% for r in entry.responses or [] %}
+      {% if stances.update({r.id: r.stance}) %}{% endif %}
+      {% if reasons.update({r.id: r.reason}) %}{% endif %}
+    {% endfor %}
+    {% set rulings = {} %}{% set why = {} %}
+    {% for r in entry.rulings or [] %}
+      {% if rulings.update({r.id: r.ruling}) %}{% endif %}
+      {% if why.update({r.id: r.reasoning}) %}{% endif %}
+    {% endfor %}
+    {% set applied = entry.applied or [] %}
+
+    {% for issue in entry.issues or [] %}
+      <div class="finding {{ issue.severity or 'low' }}">
+        <div class="fhead">
+          <span class="tag sev-{{ issue.severity or 'low' }}">{{ issue.severity or 'low' }}</span>
+          <span class="tag cat">{{ issue.category or 'issue' }}</span>
+          {% if issue.id in applied %}
+            <span class="tag applied">applied</span>
+          {% else %}
+            <span class="tag dropped">not applied</span>
+          {% endif %}
+        </div>
+
+        {% if issue.quote %}<blockquote>{{ issue.quote }}</blockquote>{% endif %}
+
+        <div class="voice auditor">
+          <span class="who">Auditor:</span> {{ issue.problem }}
+          {% if issue.fix %}<span class="wants">Wants: {{ issue.fix }}</span>{% endif %}
+        </div>
+
+        <div class="voice writer">
+          <span class="who">Writer:</span>
+          {% if issue.id not in stances %}
+            did not respond — counted as accepted.
+          {% else %}
+            {{ 'accepted' if stances[issue.id] == 'accept' else 'disputed' }}.
+            {{ reasons.get(issue.id, '') }}
+          {% endif %}
+        </div>
+
+        {% if issue.id in rulings %}
+          <div class="voice judge">
+            <span class="who">Judge:</span> {{ rulings[issue.id] }}. {{ why.get(issue.id, '') }}
+          </div>
+        {% elif stances.get(issue.id) == 'dispute' %}
+          <div class="voice judge">
+            <span class="who">Judge:</span> no ruling returned — the text stands.
+          </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% endfor %}
+
+{% endif %}
+
+</main>
+</body>
+</html>
