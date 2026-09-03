@@ -154,6 +154,7 @@ python seo_writer.py "Semantic Caching for LLMs" --output-dir ./articles --editi
 | `--verify-rounds` | Maximum audit/fix rounds before accepting the article (default: `2`) |
 | `--words` | Article length: `default` (2,500–3,500), `2000`, or `1000` |
 | `--linkedin` | Also write a LinkedIn post from the finished article |
+| `--video` | Also write a 2–3 minute video script, timed, with a visual per beat |
 | `--audit FILE` | Audit a document you already have instead of writing a new one |
 | `--apply` | With `--audit`, also save the revised document |
 
@@ -184,6 +185,19 @@ It is written to the constraints that actually matter on the platform: 150–220
 words, the first two lines carrying the whole post because that is all LinkedIn
 shows before "see more", one idea per line, no engagement bait, no em dashes,
 and at most three specific hashtags.
+
+`--video` writes `<slug>_video.md`: a 2–3 minute script as six timed beats —
+hook, core idea, why it matters, the substance, the distinction, what breaks —
+each with the **visual that carries it**, then a narration-only block at the end
+ready to paste into a teleprompter or a text-to-speech tool.
+
+The visual note is the part that matters. The failure mode of an AI-written
+script is a spoken list of abstractions that no footage can illustrate, so the
+prompt requires something actually showable — a diagram that builds, text on
+screen, a comparison filling in — and explicitly rejects "stock footage of a
+developer typing", which illustrates nothing. Runtime is measured from the
+narration alone, not the document, since headings and visual notes are not
+spoken.
 
 ---
 
@@ -337,6 +351,7 @@ Each run produces these files in `./output/`:
 | `<slug>_review.md` | What the three agents argued about, and what survived |
 | `<slug>_review.json` | The same argument as raw data |
 | `<slug>_linkedin.md` | LinkedIn post, with `--linkedin` |
+| `<slug>_video.md` | Video script, with `--video` |
 | `<slug>_usage.json` | Tokens and cost for this run, per model and per step |
 | `usage.jsonl` | One line per run — the rolling log behind `/usage` |
 

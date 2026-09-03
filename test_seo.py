@@ -379,6 +379,86 @@ def test_linkedin_post_has_its_em_dashes_stripped():
     assert "—" not in post, post
 
 
+# --- the video script -------------------------------------------------------
+
+SCRIPT_REPLY = """# T - video script
+
+**Runtime:** 2:40  **Narration:** 400 words
+
+## 1. Hook (0:00-0:15)
+**Visual:** the definition building on screen
+
+Semantic caching is not what you think it is.
+
+---
+
+## Narration only
+
+Semantic caching is not what you think it is. It stores by meaning.
+"""
+
+
+def run_video(reply=SCRIPT_REPLY, article=None):
+    seen = {}
+
+    def fake_call(prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        seen["prompt"] = prompt
+        return reply
+
+    real = sw.call_claude
+    sw.call_claude = fake_call
+    try:
+        out = sw.generate_video_script("T", article or ARTICLE,
+                                       {"keywords": {"primary_keyword": "semantic caching"}})
+    finally:
+        sw.call_claude = real
+    return out, seen["prompt"]
+
+
+def test_video_script_is_written_from_the_article():
+    _, prompt = run_video()
+    # Same reasoning as the LinkedIn post: writing from the topic alone would
+    # let it invent claims the verified article never made.
+    assert "Semantic caching stores answers by meaning" in prompt
+    assert "semantic caching" in prompt
+
+
+def test_video_prompt_asks_for_a_runtime_that_fits():
+    _, prompt = run_video()
+    assert "380 to 440 words" in prompt, "the length target must be explicit"
+    assert "2:30 to 3:00" in prompt
+
+
+def test_video_prompt_demands_a_visual_per_beat():
+    _, prompt = run_video()
+    assert "the visual that carries it" in prompt
+    # The failure mode I hit writing one of these by hand.
+    assert "stock footage of a developer typing" in prompt, \
+        "the prompt should name the visual anti-pattern"
+    assert "list of abstract nouns" in prompt
+
+
+def test_video_script_keeps_its_structure():
+    out, _ = run_video()
+    assert "## 1. Hook (0:00-0:15)" in out
+    assert "**Visual:**" in out
+    assert "## Narration only" in out
+
+
+def test_video_script_has_its_em_dashes_stripped():
+    out, _ = run_video(reply="Some narration — with an em dash.")
+    assert "—" not in out, out
+
+
+def test_runtime_is_measured_from_narration_not_the_whole_document():
+    # The document carries headings and visual notes; only the narration is
+    # spoken, so only the narration determines runtime.
+    out, _ = run_video()
+    assert out.count("Visual") == 1
+    narration = out.split("## Narration only")[-1]
+    assert len(narration.split()) < len(out.split())
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

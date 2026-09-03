@@ -1789,6 +1789,93 @@ Return ONLY the post text, ready to paste."""
     return post
 
 
+def generate_video_script(title: str, article: str, research: dict) -> str:
+    """A 2-3 minute video script drawn from the finished article.
+
+    Written as timed beats with a visual note per beat, because the failure mode
+    of an AI-written script is a spoken list of abstractions that no footage can
+    carry. Naming the visual next to the line forces the script to be about
+    something showable.
+    """
+    log("STEP 10", "Writing the video script")
+
+    kw = research.get("keywords", {})
+
+    prompt = f"""Write a 2 to 3 minute video script from the article below.
+
+WHO IS SPEAKING
+Imran Tauqir, an engineer who builds with AI agents and writes about it. He
+speaks to other engineers as a peer. Confident and plain-spoken, never hyped.
+
+LENGTH
+380 to 440 words of narration. That is 2:30 to 3:00 at a natural speaking pace.
+Count them. Going over means the video runs long and gets abandoned halfway.
+
+STRUCTURE
+Six beats, each with a timestamp, the narration, and the visual that carries it.
+
+1. HOOK, about 15 seconds. Open on the single most surprising or most useful
+   specific in the article - a distinction people get wrong, a number, a failure
+   mode. No throat-clearing, no "in today's world", no question.
+2. THE CORE IDEA, about 30 seconds. Define the thing plainly.
+3. WHY IT MATTERS, about 20 seconds. The problem it solves, concretely.
+4. THE SUBSTANCE, about 45 seconds. The part a viewer could not have guessed.
+5. THE DISTINCTION, about 30 seconds. The comparison or contrast the article
+   makes best. This is the line people will repeat, so make it quotable.
+6. WHAT BREAKS, AND CLOSE, about 30 seconds. Failure modes, then a single line
+   pointing at the full article.
+
+RULES
+- Every claim must already be in the article. Invent nothing.
+- Write for the ear. Short sentences. Vary their length. Contractions are fine.
+- Do NOT narrate a list of abstract nouns. If a beat covers several components,
+  give each one a concrete consequence rather than a label.
+- No em dashes, no "delve", "unlock", "leverage", "game-changer",
+  "in the ever-evolving landscape".
+- The visual note must describe something actually showable: a diagram that
+  builds, text on screen, a screen recording, a comparison filling in. Never
+  "stock footage of a developer typing", which illustrates nothing.
+
+TOPIC
+{kw.get("primary_keyword", title)}
+
+THE ARTICLE
+{article[:10000]}
+
+FORMAT - return exactly this markdown and nothing else:
+
+# {title} - video script
+
+**Runtime:** <your estimate>  **Narration:** <word count> words
+
+## 1. Hook (0:00-0:15)
+**Visual:** <what is on screen>
+
+<the narration>
+
+## 2. ... (and so on through beat 6)
+
+---
+
+## Narration only
+
+<every narration block, in order, with nothing else - ready to paste into a
+teleprompter or a text-to-speech tool>"""
+
+    script = _strip_em_dashes(call_claude(prompt, max_tokens=4000).strip())
+
+    # The narration block is what determines runtime, so measure that, not the
+    # whole document with its headings and visual notes.
+    tail = script.split("## Narration only")
+    narration = tail[-1] if len(tail) > 1 else script
+    words = len(narration.split())
+    print(f"  Video script: {words} words of narration, "
+          f"about {words // 150}:{(words % 150) * 60 // 150:02d} at 150 wpm")
+    if words > 520:
+        print("  That will run past three minutes.")
+    return script
+
+
 def insert_answer_block(article: str, answer: str) -> str:
     """Put the answer immediately after the H1, before anything else."""
     if not answer:
@@ -2545,7 +2632,7 @@ def review_stats(record: dict) -> dict:
 
 def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: str = "",
         verify: bool = True, verify_rounds: int = 2, words: str = "default",
-        linkedin: bool = False):
+        linkedin: bool = False, video: bool = False):
     profile = length_profile(words)
     # If intent is given and no explicit keywords, derive optimized search keywords
     if intent and not keywords:
@@ -2623,6 +2710,12 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
         linkedin_path = output_dir / f"{slug}_linkedin.md"
         linkedin_path.write_text(post, encoding="utf-8")
 
+    video_path = None
+    if video:
+        script = generate_video_script(refined_title, humanized, research)
+        video_path = output_dir / f"{slug}_video.md"
+        video_path.write_text(script, encoding="utf-8")
+
     usage_path = write_usage(slug, output_dir, refined_title)
 
     # Summary
@@ -2642,6 +2735,8 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
               f"{s['applied']} applied over {s['rounds']} round(s)")
     if linkedin_path:
         print(f"  LinkedIn   : {linkedin_path}")
+    if video_path:
+        print(f"  Video      : {video_path}")
     print(f"  Usage JSON : {usage_path}")
     print_usage_summary()
     print(f"{'='*60}\n")
@@ -2805,6 +2900,12 @@ def main():
               "<slug>_linkedin.md"),
     )
     parser.add_argument(
+        "--video",
+        action="store_true",
+        help=("Also write a 2-3 minute video script from the finished article, "
+              "with a visual note per beat, saved as <slug>_video.md"),
+    )
+    parser.add_argument(
         "--audit",
         metavar="FILE",
         default=None,
@@ -2858,6 +2959,7 @@ def main():
             verify_rounds=args.verify_rounds,
             words=args.words,
             linkedin=args.linkedin,
+            video=args.video,
         )
     except ClaudeError as e:
         # Flattened to one line so the web UI, which reads the log line by line,

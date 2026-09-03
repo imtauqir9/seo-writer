@@ -233,6 +233,8 @@
   .btn-li:hover    { background: #d9e9f8; }
   .btn-rev   { color: #6b3fa0; border-color: #c4aede; background: #f5f0fb; }
   .btn-rev:hover   { background: #eadff7; }
+  .btn-vid   { color: #b03a2e; border-color: #e6b0aa; background: #fdf1ef; }
+  .btn-vid:hover   { background: #fadfda; }
 
   .empty-state {
     color: #aaa;
@@ -359,8 +361,13 @@
         <input type="checkbox" id="linkedin">
         <label for="linkedin">Also write a LinkedIn post</label>
       </div>
-      <p class="hint" style="margin-top:4px">Written from the finished article, so it
-        can only claim what the article actually established.</p>
+      <div class="checkline" style="margin-top:8px">
+        <input type="checkbox" id="video">
+        <label for="video">Also write a 2-3 minute video script</label>
+      </div>
+      <p class="hint" style="margin-top:4px">Both are written from the finished
+        article, so they can only claim what it actually established. The script
+        comes as timed beats with a visual note on each.</p>
 
       <button type="submit" id="submitBtn" style="margin-top:16px">Generate Article</button>
     </form>
@@ -399,6 +406,9 @@
             <a class="btn-link btn-md" href="/output/{{ a.slug }}.md" target="_blank">Markdown</a>
             {% if a.linkedin_file %}
             <a class="btn-link btn-li" href="/output/{{ a.linkedin_file }}" target="_blank">LinkedIn</a>
+            {% endif %}
+            {% if a.video_file %}
+            <a class="btn-link btn-vid" href="/output/{{ a.video_file }}" target="_blank">Video script</a>
             {% endif %}
             {% if a.has_review %}
             <a class="btn-link btn-rev" href="/review/{{ a.slug }}">Review</a>
@@ -453,6 +463,7 @@ function renderArticles(articles) {
         ${a.docx_file ? `<a class="btn-link btn-docx" href="/output/${encodeURIComponent(a.docx_file)}" download>DOCX</a>` : ''}
         <a class="btn-link btn-md" href="/output/${encodeURIComponent(a.slug)}.md" target="_blank">Markdown</a>
         ${a.linkedin_file ? `<a class="btn-link btn-li" href="/output/${encodeURIComponent(a.linkedin_file)}" target="_blank">LinkedIn</a>` : ''}
+        ${a.video_file ? `<a class="btn-link btn-vid" href="/output/${encodeURIComponent(a.video_file)}" target="_blank">Video script</a>` : ''}
         ${a.has_review ? `<a class="btn-link btn-rev" href="/review/${encodeURIComponent(a.slug)}">Review</a>` : ''}
       </div>
     </div>
@@ -615,6 +626,7 @@ form.addEventListener('submit', async (e) => {
   const edition  = parseInt(document.getElementById('edition').value) || 0;
   const words    = document.getElementById('words').value;
   const linkedin = document.getElementById('linkedin').checked;
+  const video    = document.getElementById('video').checked;
 
   if (!topic) return;
 
@@ -624,6 +636,7 @@ form.addEventListener('submit', async (e) => {
     `Topic  : ${topic}`,
     `Length : ${document.getElementById('words').selectedOptions[0].text}`,
     ...(linkedin ? ['Extra  : LinkedIn post'] : []),
+    ...(video ? ['Extra  : video script'] : []),
     ...(intent ? [`Intent : ${intent}`] : []),
     'Starting pipeline…\n',
   ]);
@@ -634,7 +647,7 @@ form.addEventListener('submit', async (e) => {
     const startResp = await fetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, intent: intent || keywords, edition, words, linkedin }),
+      body: JSON.stringify({ topic, intent: intent || keywords, edition, words, linkedin, video }),
     });
     const startData = await startResp.json();
     if (startData.error) throw new Error(startData.error);

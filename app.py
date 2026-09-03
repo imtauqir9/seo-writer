@@ -232,6 +232,7 @@ def list_articles() -> list[dict]:
         html_file = html_files[0].name if html_files else None
         docx_file = docx_files[0].name if docx_files else None
         linkedin_path = OUTPUT_DIR / f"{slug}_linkedin.md"
+        video_path = OUTPUT_DIR / f"{slug}_video.md"
         review_path = OUTPUT_DIR / f"{slug}_review.json"
 
         word_count = 0
@@ -256,6 +257,7 @@ def list_articles() -> list[dict]:
             "docx_file": docx_file,
             "image_count": len(meta.get("images", [])),
             "linkedin_file": linkedin_path.name if linkedin_path.exists() else None,
+            "video_file": video_path.name if video_path.exists() else None,
             "has_review": review_path.exists(),
         })
     return articles
@@ -373,6 +375,7 @@ def api_start():
     if words not in {"default", "1000", "2000"}:
         words = "default"
     linkedin = bool(data.get("linkedin"))
+    video = bool(data.get("video"))
 
     if not topic:
         return jsonify({"error": "topic is required"}), 400
@@ -388,6 +391,8 @@ def api_start():
         cmd += ["--intent", intent]
     if linkedin:
         cmd.append("--linkedin")
+    if video:
+        cmd.append("--video")
 
     return jsonify({"job_id": _spawn(cmd)})
 
