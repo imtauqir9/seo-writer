@@ -467,12 +467,20 @@ def call_claude(prompt: str, system: str = "", max_tokens: int = 16000,
     # out rather than indexing blindly.
     text = next((b.text for b in response.content if b.type == "text"), None)
 
+    # A response cut off at the cap used to be returned as if it were complete
+    # whenever it had any text at all. Half a JSON object then failed further
+    # down with a misleading error about the model "answering in prose". Thinking
+    # tokens count toward this cap, so a high-effort step reaches it sooner than
+    # its output length suggests.
+    if response.stop_reason == "max_tokens":
+        written = len((text or "").split())
+        raise ClaudeError(
+            f"{model} hit the {max_tokens:,}-token output cap and its answer was "
+            f"cut off after about {written} words. Thinking tokens count toward "
+            f"that cap, so raise max_tokens for this step or lower its effort."
+        )
+
     if text is None or not text.strip():
-        if response.stop_reason == "max_tokens":
-            raise ClaudeError(
-                f"Claude hit the {max_tokens}-token output cap before writing a "
-                f"response. Raise max_tokens for this step."
-            )
         raise ClaudeError(
             f"Claude returned no text (stop_reason: {response.stop_reason})."
         )
@@ -2168,7 +2176,7 @@ Return ONLY valid JSON in exactly this shape:
 Use "pass" only when there is nothing above low severity. Number the ids i1, i2, i3 in
 order. Return at most 12 issues, most severe first."""
 
-    response = call_agent(auditor, prompt, system=VERIFY_SYSTEM, max_tokens=8000)
+    response = call_agent(auditor, prompt, system=VERIFY_SYSTEM, max_tokens=16000)
     report = extract_json(response)
 
     issues = report.get("issues", []) or []
@@ -2238,7 +2246,7 @@ Return ONLY valid JSON:
 
 Include exactly one response per finding id."""
 
-    response = call_claude(prompt, system=WRITER_SYSTEM, max_tokens=4000)
+    response = call_claude(prompt, system=WRITER_SYSTEM, max_tokens=8000)
     result = extract_json(response)
 
     responses = result.get("responses", []) or []
@@ -2287,7 +2295,7 @@ Include exactly one ruling per contested finding."""
 
     # call_agent carries the fallback: a judge outage must not destroy an article
     # that already cost a dozen calls to produce.
-    response = call_agent(judge, prompt, system=JUDGE_SYSTEM, max_tokens=4000)
+    response = call_agent(judge, prompt, system=JUDGE_SYSTEM, max_tokens=8000)
     result = extract_json(response)
 
     for r in result.get("rulings", []) or []:
@@ -2359,8 +2367,20 @@ def verification_loop(article: str, outline: str, key_takeaways: str, research: 
         return article
 
     for round_no in range(1, max_rounds + 1):
-        report = verify_content(article, outline, key_takeaways, research, round_no,
-                                agents=agents)
+        # The article at this point has cost a dozen calls to produce. A stage
+        # whose whole job is to check it must not be the thing that destroys it,
+        # so a failed round ends verification and keeps the text as it stands.
+        try:
+            report = verify_content(article, outline, key_takeaways, research,
+                                    round_no, agents=agents)
+        except ClaudeError as e:
+            reason = " ".join(str(e).split())[:200]
+            print(f"  Verification could not run: {reason}")
+            print(f"  Keeping the article as written. It was not checked.")
+            if record is not None:
+                record["error"] = reason
+            return close(f"verification failed on round {round_no}")
+
         issues = report.get("issues", []) or []
 
         entry = {"round": round_no, "verdict": report.get("verdict"),
@@ -2374,7 +2394,12 @@ def verification_loop(article: str, outline: str, key_takeaways: str, research: 
             return close(f"passed on round {round_no}")
 
         by_id = {i.get("id"): i for i in issues if i.get("id")}
-        rebuttal = writer_rebuttal(article, issues)
+        try:
+            rebuttal = writer_rebuttal(article, issues)
+        except ClaudeError as e:
+            print(f"  The writer could not answer: {' '.join(str(e).split())[:160]}")
+            print("  Applying every finding unanswered, as silence implies.")
+            rebuttal = {"responses": []}
         entry["responses"] = rebuttal.get("responses", []) or []
 
         upheld, disputed = [], []
@@ -2394,7 +2419,12 @@ def verification_loop(article: str, outline: str, key_takeaways: str, research: 
         upheld += unanswered
 
         if disputed:
-            rulings = judge_disputes(article, disputed, agents=agents)
+            try:
+                rulings = judge_disputes(article, disputed, agents=agents)
+            except ClaudeError as e:
+                print(f"  The judge could not rule: {' '.join(str(e).split())[:160]}")
+                print("  Unruled disputes leave the text standing.")
+                rulings = {"rulings": []}
             entry["rulings"] = rulings.get("rulings", []) or []
             ruled = {r.get("id"): r.get("ruling") for r in entry["rulings"]}
             for issue in disputed:
@@ -2410,7 +2440,15 @@ def verification_loop(article: str, outline: str, key_takeaways: str, research: 
             print("  Every finding was overruled. Article left as written.")
             return close(f"every finding overruled on round {round_no}")
 
-        article = apply_fixes(article, upheld)
+        try:
+            article = apply_fixes(article, upheld)
+        except ClaudeError as e:
+            reason = " ".join(str(e).split())[:200]
+            print(f"  The fix pass failed: {reason}")
+            print("  Keeping the last good version of the article.")
+            if record is not None:
+                record["error"] = reason
+            return close(f"fix pass failed on round {round_no}")
         entry["words_after_fix"] = len(article.split())
 
     print(f"  Reached the {max_rounds}-round limit. Using the latest revision.")

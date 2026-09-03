@@ -565,6 +565,91 @@ def test_a_json_list_is_not_accepted_as_an_object():
         raise AssertionError("a list should not satisfy extract_json")
 
 
+# --- a failed stage must not destroy the article ----------------------------
+#
+# The article reaching stage 6.5 has already cost a dozen calls. A stage whose
+# job is to check it must never be the thing that throws it away.
+
+class Boom(Stub):
+    """A stub where one named role raises instead of answering."""
+
+    def __init__(self, fails, **kw):
+        super().__init__(**kw)
+        self.fails = fails
+
+    def _route(self, system, vendor, model):
+        role = {sw.VERIFY_SYSTEM: "verify", sw.WRITER_SYSTEM: "rebut",
+                sw.JUDGE_SYSTEM: "judge"}.get(system, "fix")
+        if role in self.fails:
+            self.calls.append(("attempt-" + role, model))
+            raise sw.ClaudeError("the model hit its output cap")
+        return super()._route(system, vendor, model)
+
+
+def test_a_failed_audit_returns_the_article_untouched():
+    with keys("ANTHROPIC_API_KEY"):
+        stub = Boom({"verify"}, reports=[PASS_REPORT])
+        install(stub)
+        record = {}
+        out = sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                                   max_rounds=2, record=record)
+    assert out == ARTICLE, "a broken audit must not change the article"
+    assert "verification failed" in record["outcome"], record["outcome"]
+    assert "output cap" in record["error"], record["error"]
+
+
+def test_a_failed_rebuttal_applies_every_finding():
+    # Silence already counts as acceptance; an unreachable writer is silence.
+    with keys("ANTHROPIC_API_KEY"):
+        stub = Boom({"rebut"}, reports=[revise(ISSUE_A, ISSUE_B), PASS_REPORT])
+        install(stub)
+        applied = {}
+        real = sw.apply_fixes
+
+        def spy(article, upheld):
+            applied["ids"] = sorted(i.get("id") for i in upheld)
+            return real(article, upheld)
+
+        sw.apply_fixes = spy
+        try:
+            out = sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                                       max_rounds=2)
+        finally:
+            sw.apply_fixes = real
+    assert applied["ids"] == ["i1", "i2"], applied
+    assert "revised" in out
+
+
+def test_a_failed_judge_leaves_disputed_text_standing():
+    with keys("ANTHROPIC_API_KEY"):
+        stub = Boom(
+            {"judge"},
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "dispute",
+                                       "reason": "deliberate"}]}],
+        )
+        install(stub)
+        out = sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                                   max_rounds=2)
+    assert out == ARTICLE, "an unruled dispute leaves the text as written"
+
+
+def test_a_failed_fix_pass_keeps_the_last_good_version():
+    with keys("ANTHROPIC_API_KEY"):
+        stub = Boom(
+            {"fix"},
+            reports=[revise(ISSUE_A), PASS_REPORT],
+            rebuttals=[{"responses": [{"id": "i1", "stance": "accept",
+                                       "reason": "ok"}]}],
+        )
+        install(stub)
+        record = {}
+        out = sw.verification_loop(ARTICLE, OUTLINE, TAKEAWAYS, RESEARCH,
+                                   max_rounds=2, record=record)
+    assert out == ARTICLE, "a failed rewrite must not lose the article"
+    assert "fix pass failed" in record["outcome"], record["outcome"]
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
