@@ -37,3 +37,6 @@ chapters/
 .vscode/
 *.swp
 *.swo
+
+# scratch downloads
+*.tmp.md
