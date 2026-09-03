@@ -279,6 +279,106 @@ def test_canonical_is_omitted_when_site_url_is_unset():
         sw.SITE_URL = prev
 
 
+# --- article length ---------------------------------------------------------
+
+def test_the_three_lengths_exist_and_differ():
+    names = set(sw.LENGTH_PROFILES)
+    assert names == {"default", "1000", "2000"}, names
+    words = {n: sw.LENGTH_PROFILES[n]["words"] for n in names}
+    assert len(set(words.values())) == 3, words
+
+
+def test_unknown_or_missing_length_falls_back_to_default():
+    for value in (None, "", "600", "enormous", "DEFAULT "):
+        assert sw.length_profile(value)["words"] == \
+               sw.LENGTH_PROFILES["default"]["words"], value
+
+
+def test_a_shorter_article_asks_for_less_of_everything():
+    # A short article must be short, not a full-length outline crammed down.
+    short = sw.length_profile("1000")
+    mid = sw.length_profile("2000")
+    full = sw.length_profile("default")
+
+    def low(profile, key):
+        return int(profile[key].split("-")[0].replace(",", ""))
+
+    for key in ("sections", "images", "faq", "intro", "conclusion", "words"):
+        assert low(short, key) <= low(mid, key) <= low(full, key), key
+
+
+def test_length_reaches_the_outline_and_the_writer():
+    seen = {}
+
+    def fake_call(prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        seen.setdefault("prompts", []).append(prompt)
+        return "## An outline"
+
+    real = sw.call_claude
+    sw.call_claude = fake_call
+    try:
+        profile = sw.length_profile("1000")
+        sw.generate_outline("T", "kw", {"keywords": {}}, "takeaways", profile=profile)
+        sw.write_content("T", "kw", "outline", {"keywords": {}}, "takeaways",
+                         profile=profile)
+    finally:
+        sw.call_claude = real
+
+    outline_prompt, writer_prompt = seen["prompts"]
+    assert "900-1,100" in outline_prompt, "the outline must know the target"
+    assert "3-4 H2 main sections" in outline_prompt, outline_prompt[:400]
+    assert "900-1,100 words total" in writer_prompt, "the writer must know the target"
+
+
+def test_the_writer_defaults_when_given_no_profile():
+    seen = {}
+
+    def fake_call(prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        seen["prompt"] = prompt
+        return "text"
+
+    real = sw.call_claude
+    sw.call_claude = fake_call
+    try:
+        sw.write_content("T", "kw", "outline", {"keywords": {}}, "takeaways")
+    finally:
+        sw.call_claude = real
+    assert "2,500-3,500" in seen["prompt"]
+
+
+# --- the LinkedIn post ------------------------------------------------------
+
+def test_linkedin_post_is_built_from_the_article_not_the_topic():
+    seen = {}
+
+    def fake_call(prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        seen["prompt"] = prompt
+        return "A post about semantic caching.\n\nRead the full piece."
+
+    real = sw.call_claude
+    sw.call_claude = fake_call
+    try:
+        post = sw.generate_linkedin_post("Semantic caching", ARTICLE,
+                                         {"keywords": {"primary_keyword": "semantic caching"}})
+    finally:
+        sw.call_claude = real
+
+    # The article body has to be in the prompt, or the post can invent claims.
+    assert "Semantic caching stores answers by meaning" in seen["prompt"]
+    assert "semantic caching" in seen["prompt"]
+    assert "A post about semantic caching." in post
+
+
+def test_linkedin_post_has_its_em_dashes_stripped():
+    real = sw.call_claude
+    sw.call_claude = lambda *a, **k: "One line — with an em dash.\n\nAnother line."
+    try:
+        post = sw.generate_linkedin_post("T", ARTICLE, {"keywords": {}})
+    finally:
+        sw.call_claude = real
+    assert "—" not in post, post
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

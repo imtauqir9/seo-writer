@@ -71,6 +71,7 @@
 
   input[type="text"],
   input[type="number"],
+  select,
   textarea {
     width: 100%;
     border: 1px solid #ddd;
@@ -85,6 +86,7 @@
   }
   input[type="text"]:focus,
   input[type="number"]:focus,
+  select:focus,
   textarea:focus {
     outline: none;
     border-color: #111;
@@ -227,6 +229,10 @@
   .btn-docx:hover  { background: #d6f0e2; }
   .btn-md    { color: #7a4a00; border-color: #f0ca80; background: #fef9ee; }
   .btn-md:hover    { background: #fdf0cc; }
+  .btn-li    { color: #0a66c2; border-color: #9dc4ec; background: #eef5fc; }
+  .btn-li:hover    { background: #d9e9f8; }
+  .btn-rev   { color: #6b3fa0; border-color: #c4aede; background: #f5f0fb; }
+  .btn-rev:hover   { background: #eadff7; }
 
   .empty-state {
     color: #aaa;
@@ -338,7 +344,25 @@
         </div>
       </div>
 
-      <button type="submit" id="submitBtn">Generate Article</button>
+      <div style="margin-top:14px">
+        <label for="words">Length</label>
+        <select id="words" name="words">
+          <option value="default" selected>Default — 2,500–3,500 words</option>
+          <option value="2000">Medium — about 2,000 words</option>
+          <option value="1000">Short — about 1,000 words</option>
+        </select>
+        <p class="hint">Sections, images and FAQ count scale with this, so a short
+          article reads short rather than cramped.</p>
+      </div>
+
+      <div class="checkline" style="margin-top:14px">
+        <input type="checkbox" id="linkedin">
+        <label for="linkedin">Also write a LinkedIn post</label>
+      </div>
+      <p class="hint" style="margin-top:4px">Written from the finished article, so it
+        can only claim what the article actually established.</p>
+
+      <button type="submit" id="submitBtn" style="margin-top:16px">Generate Article</button>
     </form>
     </div><!-- /modeWrite -->
 
@@ -373,6 +397,12 @@
             <a class="btn-link btn-docx" href="/output/{{ a.docx_file }}" download>DOCX</a>
             {% endif %}
             <a class="btn-link btn-md" href="/output/{{ a.slug }}.md" target="_blank">Markdown</a>
+            {% if a.linkedin_file %}
+            <a class="btn-link btn-li" href="/output/{{ a.linkedin_file }}" target="_blank">LinkedIn</a>
+            {% endif %}
+            {% if a.has_review %}
+            <a class="btn-link btn-rev" href="/review/{{ a.slug }}">Review</a>
+            {% endif %}
           </div>
         </div>
         {% endfor %}
@@ -422,6 +452,8 @@ function renderArticles(articles) {
         ${a.html_file ? `<a class="btn-link btn-html" href="/output/${encodeURIComponent(a.html_file)}" target="_blank">HTML</a>` : ''}
         ${a.docx_file ? `<a class="btn-link btn-docx" href="/output/${encodeURIComponent(a.docx_file)}" download>DOCX</a>` : ''}
         <a class="btn-link btn-md" href="/output/${encodeURIComponent(a.slug)}.md" target="_blank">Markdown</a>
+        ${a.linkedin_file ? `<a class="btn-link btn-li" href="/output/${encodeURIComponent(a.linkedin_file)}" target="_blank">LinkedIn</a>` : ''}
+        ${a.has_review ? `<a class="btn-link btn-rev" href="/review/${encodeURIComponent(a.slug)}">Review</a>` : ''}
       </div>
     </div>
   `).join('');
@@ -581,6 +613,8 @@ form.addEventListener('submit', async (e) => {
   const intent   = document.getElementById('intent').value.trim();
   const keywords = document.getElementById('keywords').value.trim();
   const edition  = parseInt(document.getElementById('edition').value) || 0;
+  const words    = document.getElementById('words').value;
+  const linkedin = document.getElementById('linkedin').checked;
 
   if (!topic) return;
 
@@ -588,6 +622,8 @@ form.addEventListener('submit', async (e) => {
   submitBtn.textContent = 'Generating…';
   startProgress([
     `Topic  : ${topic}`,
+    `Length : ${document.getElementById('words').selectedOptions[0].text}`,
+    ...(linkedin ? ['Extra  : LinkedIn post'] : []),
     ...(intent ? [`Intent : ${intent}`] : []),
     'Starting pipeline…\n',
   ]);
@@ -598,7 +634,7 @@ form.addEventListener('submit', async (e) => {
     const startResp = await fetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, intent: intent || keywords, edition }),
+      body: JSON.stringify({ topic, intent: intent || keywords, edition, words, linkedin }),
     });
     const startData = await startResp.json();
     if (startData.error) throw new Error(startData.error);

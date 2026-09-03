@@ -298,6 +298,43 @@ def write_usage(slug: str, output_dir: Path, title: str = "") -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------
+# Article length
+# ---------------------------------------------------------------------------
+#
+# Word count is not one instruction, it is a shape. Telling the writer "1,000
+# words" while the outline still demands seven sections, eight images and five
+# FAQ questions produces a thin, cramped article rather than a short one, so
+# every structural number moves together.
+
+LENGTH_PROFILES = {
+    "default": {
+        "label": "Default (2,500-3,500 words)",
+        "words": "2,500-3,500",
+        "sections": "5-7", "subsections": "2-3", "images": "6-8", "faq": "4-5",
+        "intro": "150-200", "conclusion": "150-200",
+    },
+    "2000": {
+        "label": "Medium (about 2,000 words)",
+        "words": "1,800-2,200",
+        "sections": "4-6", "subsections": "2", "images": "4-5", "faq": "4",
+        "intro": "120-150", "conclusion": "120-150",
+    },
+    "1000": {
+        "label": "Short (about 1,000 words)",
+        "words": "900-1,100",
+        "sections": "3-4", "subsections": "1-2", "images": "2-3", "faq": "3",
+        "intro": "80-110", "conclusion": "80-110",
+    },
+}
+
+
+def length_profile(name: str | None) -> dict:
+    """Resolve a --words value to a profile, falling back to the default."""
+    return LENGTH_PROFILES.get(str(name or "default").strip().lower(),
+                               LENGTH_PROFILES["default"])
+
+
 SERPAPI_BASE = "https://serpapi.com/search.json"
 UNSPLASH_BASE = "https://unsplash.com/s/photos"
 
@@ -768,8 +805,10 @@ Write the takeaways as a concise bullet list (4–5 items). Each should be a cle
 # Step 4: Outline
 # ---------------------------------------------------------------------------
 
-def generate_outline(title: str, keywords: str, research: dict, key_takeaways: str) -> str:
-    log("STEP 4", "Generating article outline")
+def generate_outline(title: str, keywords: str, research: dict, key_takeaways: str,
+                     profile: dict | None = None) -> str:
+    profile = profile or length_profile(None)
+    log("STEP 4", f"Generating article outline - {profile['label']}")
 
     kw_data = research.get("keywords", {})
     secondary_kws = ", ".join(kw_data.get("secondary_keywords", []))
@@ -781,7 +820,7 @@ def generate_outline(title: str, keywords: str, research: dict, key_takeaways: s
 ARTICLE SPECIFICATIONS
 Title: {title}
 Primary Keyword: {keywords}
-Target Word Count: 2,500–3,500 words
+Target Word Count: {profile['words']} words
 Writing Tone: {research.get("writing_tone")}
 Writing Style: {research.get("writing_style")}
 
@@ -805,19 +844,19 @@ Long-tail Keywords: {long_tail_kws}
 OUTLINE REQUIREMENTS
 Produce a detailed markdown outline with:
 1. H1 (the article title)
-2. Introduction section (150–200 words)
-3. 5–7 H2 main sections, each with 2–3 H3 subsections
+2. Introduction section ({profile['intro']} words)
+3. {profile['sections']} H2 main sections, each with {profile['subsections']} H3 subsections
 4. For each section: brief description of what to cover (1–2 sentences)
-5. 6–8 image placement markers formatted as:
+5. {profile['images']} image placement markers formatted as:
    [IMAGE: <descriptive alt text> | Query: <google image search query>]
 6. At least one comparison table, placed in whichever section it genuinely belongs
    to. Note its columns in the outline. Tables are the passage an answer engine is
    most likely to quote whole, so give it real rows: prices, versions, tradeoffs,
    or a this-vs-that. Do not invent a table where the topic has nothing to compare.
-7. A FAQ section with 4–5 questions. Each MUST be an H3 phrased as a real question
+7. A FAQ section with {profile['faq']} questions. Each MUST be an H3 phrased as a real question
    ending in a question mark, and each answer must stand on its own without the
    surrounding page - they are extracted into FAQPage structured data.
-8. Conclusion section (150–200 words with CTA)
+8. Conclusion section ({profile['conclusion']} words with CTA)
 9. Supplementary metadata block at the end:
    - URL slug suggestion
    - 5–7 internal linking opportunities
@@ -834,8 +873,11 @@ Format as clean markdown. Be specific — each section note should guide the wri
 # Step 5: Write Content
 # ---------------------------------------------------------------------------
 
-def write_content(title: str, keywords: str, outline: str, research: dict, key_takeaways: str) -> str:
-    log("STEP 5", "Writing article content (this may take a moment...)")
+def write_content(title: str, keywords: str, outline: str, research: dict,
+                  key_takeaways: str, profile: dict | None = None) -> str:
+    profile = profile or length_profile(None)
+    log("STEP 5", f"Writing article content, target {profile['words']} words "
+                  f"(this may take a moment...)")
 
     kw_data = research.get("keywords", {})
     secondary_kws = ", ".join(kw_data.get("secondary_keywords", []))
@@ -873,9 +915,10 @@ INSTRUCTIONS
    own - those pairs become FAQPage structured data.
 7. Build any comparison table the outline calls for as a real markdown table with a
    header row. It is the passage most likely to be quoted whole by an answer engine.
-7. Target 2,500–3,500 words total.
-8. Bold key terms on first use.
-9. End with a strong call-to-action.
+8. Target {profile['words']} words total. This is a real constraint, not a
+   suggestion: cut depth rather than sections, and never pad to reach it.
+9. Bold key terms on first use.
+10. End with a strong call-to-action.
 
 Write the full article now. Output the article content ONLY."""
 
@@ -1685,6 +1728,59 @@ Return ONLY the answer paragraph."""
     return answer
 
 
+def generate_linkedin_post(title: str, article: str, research: dict,
+                           article_url: str = "") -> str:
+    """A LinkedIn post drawn from the finished article.
+
+    Written from the verified article rather than the topic, so the post can
+    only claim things the article actually established - a post generated from
+    the brief would be free to invent a statistic the article never supports.
+    """
+    log("STEP 9", "Writing the LinkedIn post")
+
+    kw = research.get("keywords", {})
+    link = article_url or (f"{SITE_URL}/{slugify(title)}" if SITE_URL else "")
+
+    prompt = f"""Write a LinkedIn post for the article below, in the author's own voice.
+
+WHO IS POSTING
+Imran Tauqir, an engineer who builds with AI agents and writes about it. He posts
+as a practitioner, not a commentator. He is not selling anything in this post.
+
+WHAT THE POST HAS TO DO
+Earn the click from someone scrolling past. LinkedIn shows roughly the first two
+lines before "see more", so those two lines carry the entire post.
+
+RULES
+- 150 to 220 words. Longer gets truncated and skipped.
+- Open with the single most surprising or useful specific thing in the article -
+  a distinction, a number, a failure mode. Never open with a question, never with
+  "I've been thinking about", never with "In today's world".
+- One idea per line. Blank line between them. Dense paragraphs do not get read.
+- Use only claims the article actually makes. Invent nothing.
+- Plain language. No emoji except at most one, and only if it earns its place.
+- No em dashes. No "game-changer", "unlock", "dive into", "leverage", "in the
+  ever-evolving landscape".
+- No engagement bait: no "thoughts?", no "agree?", no "comment below".
+- End with one line pointing to the full article{f", linking {link}" if link else ""}.
+- At most 3 hashtags, on the final line, specific rather than generic.
+
+TOPIC
+{kw.get("primary_keyword", title)}
+
+THE ARTICLE
+{article[:8000]}
+
+Return ONLY the post text, ready to paste."""
+
+    post = _strip_em_dashes(call_claude(prompt, max_tokens=1500).strip())
+    words = len(post.split())
+    print(f"  LinkedIn post: {words} words")
+    if words > 320:
+        print("  Post came back long; LinkedIn will truncate it in the feed.")
+    return post
+
+
 def insert_answer_block(article: str, answer: str) -> str:
     """Put the answer immediately after the H1, before anything else."""
     if not answer:
@@ -2410,7 +2506,9 @@ def review_stats(record: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: str = "",
-        verify: bool = True, verify_rounds: int = 2):
+        verify: bool = True, verify_rounds: int = 2, words: str = "default",
+        linkedin: bool = False):
+    profile = length_profile(words)
     # If intent is given and no explicit keywords, derive optimized search keywords
     if intent and not keywords:
         log("INTENT", "Extracting search keywords from intent...")
@@ -2425,6 +2523,7 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     print(f"Keywords: {keywords}")
     if intent:
         print(f"Intent  : {intent[:80]}{'...' if len(intent) > 80 else ''}")
+    print(f"Length  : {profile['label']}")
     print(f"Output  : {output_dir}")
     print(f"{'='*60}")
 
@@ -2438,10 +2537,12 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     key_takeaways = generate_key_takeaways(refined_title, keywords, research)
 
     # Step 4: Outline
-    outline = generate_outline(refined_title, keywords, research, key_takeaways)
+    outline = generate_outline(refined_title, keywords, research, key_takeaways,
+                               profile=profile)
 
     # Step 5: Write Content
-    content = write_content(refined_title, keywords, outline, research, key_takeaways)
+    content = write_content(refined_title, keywords, outline, research, key_takeaways,
+                            profile=profile)
 
     # Step 6: Humanize
     humanized = humanize_content(content)
@@ -2478,6 +2579,12 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
     review_path = None
     if record.get("rounds"):
         review_path, _ = write_review(slug, record, output_dir, refined_title)
+    linkedin_path = None
+    if linkedin:
+        post = generate_linkedin_post(refined_title, humanized, research)
+        linkedin_path = output_dir / f"{slug}_linkedin.md"
+        linkedin_path.write_text(post, encoding="utf-8")
+
     usage_path = write_usage(slug, output_dir, refined_title)
 
     # Summary
@@ -2495,6 +2602,8 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
         print(f"  Argument   : {s['raised']} raised, {s['disputed']} disputed, "
               f"{s['upheld']} upheld, {s['overruled']} overruled, "
               f"{s['applied']} applied over {s['rounds']} round(s)")
+    if linkedin_path:
+        print(f"  LinkedIn   : {linkedin_path}")
     print(f"  Usage JSON : {usage_path}")
     print_usage_summary()
     print(f"{'='*60}\n")
@@ -2642,6 +2751,22 @@ def main():
         help="Maximum audit/fix rounds before accepting the article (default: 2)",
     )
     parser.add_argument(
+        "--words",
+        choices=sorted(LENGTH_PROFILES),
+        default="default",
+        help=(
+            "Article length. Every structural number moves with it - sections, "
+            "subsections, images and FAQ count - so a short article is short "
+            "rather than cramped. Default is 2,500-3,500 words."
+        ),
+    )
+    parser.add_argument(
+        "--linkedin",
+        action="store_true",
+        help=("Also write a LinkedIn post from the finished article, saved as "
+              "<slug>_linkedin.md"),
+    )
+    parser.add_argument(
         "--audit",
         metavar="FILE",
         default=None,
@@ -2693,6 +2818,8 @@ def main():
             intent=intent,
             verify=not args.no_verify,
             verify_rounds=args.verify_rounds,
+            words=args.words,
+            linkedin=args.linkedin,
         )
     except ClaudeError as e:
         # Flattened to one line so the web UI, which reads the log line by line,

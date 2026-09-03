@@ -152,8 +152,38 @@ python seo_writer.py "Semantic Caching for LLMs" --output-dir ./articles --editi
 | `--edition` | Newsletter edition number |
 | `--no-verify` | Skip the step 6.5 audit — faster and cheaper, but nothing checks the article's claims or structure before it hits disk |
 | `--verify-rounds` | Maximum audit/fix rounds before accepting the article (default: `2`) |
+| `--words` | Article length: `default` (2,500–3,500), `2000`, or `1000` |
+| `--linkedin` | Also write a LinkedIn post from the finished article |
 | `--audit FILE` | Audit a document you already have instead of writing a new one |
 | `--apply` | With `--audit`, also save the revised document |
+
+---
+
+## Length and the LinkedIn post
+
+`--words` takes `default`, `2000` or `1000`, and the dropdown in the web form
+does the same thing. Length is not a single instruction: telling the writer
+"1,000 words" while the outline still demands seven sections, eight images and
+five FAQ questions produces a cramped article rather than a short one. So every
+structural number moves together.
+
+| | Default | 2000 | 1000 |
+|---|---|---|---|
+| Words | 2,500–3,500 | 1,800–2,200 | 900–1,100 |
+| H2 sections | 5–7 | 4–6 | 3–4 |
+| H3 per section | 2–3 | 2 | 1–2 |
+| Images | 6–8 | 4–5 | 2–3 |
+| FAQ questions | 4–5 | 4 | 3 |
+
+`--linkedin` writes `<slug>_linkedin.md` alongside the article. The post is
+generated **from the finished, verified article** rather than from the brief, so
+it can only claim things the article actually established — a post written from
+the topic alone is free to invent a statistic the article never supports.
+
+It is written to the constraints that actually matter on the platform: 150–220
+words, the first two lines carrying the whole post because that is all LinkedIn
+shows before "see more", one idea per line, no engagement bait, no em dashes,
+and at most three specific hashtags.
 
 ---
 
@@ -306,6 +336,7 @@ Each run produces these files in `./output/`:
 | `<slug>_meta.json` | SEO title, meta description, slug, image URLs |
 | `<slug>_review.md` | What the three agents argued about, and what survived |
 | `<slug>_review.json` | The same argument as raw data |
+| `<slug>_linkedin.md` | LinkedIn post, with `--linkedin` |
 | `<slug>_usage.json` | Tokens and cost for this run, per model and per step |
 | `usage.jsonl` | One line per run — the rolling log behind `/usage` |
 

@@ -231,6 +231,8 @@ def list_articles() -> list[dict]:
         docx_files = sorted(OUTPUT_DIR.glob(f"{slug}*.docx"), key=lambda p: p.stat().st_mtime, reverse=True)
         html_file = html_files[0].name if html_files else None
         docx_file = docx_files[0].name if docx_files else None
+        linkedin_path = OUTPUT_DIR / f"{slug}_linkedin.md"
+        review_path = OUTPUT_DIR / f"{slug}_review.json"
 
         word_count = 0
         if md_path.exists():
@@ -253,6 +255,8 @@ def list_articles() -> list[dict]:
             "html_file": html_file,
             "docx_file": docx_file,
             "image_count": len(meta.get("images", [])),
+            "linkedin_file": linkedin_path.name if linkedin_path.exists() else None,
+            "has_review": review_path.exists(),
         })
     return articles
 
@@ -361,7 +365,14 @@ def api_start():
     data = request.get_json(silent=True) or {}
     topic = (data.get("topic") or "").strip()
     intent = (data.get("intent") or "").strip()
-    edition = int(data.get("edition") or 0)
+    try:
+        edition = int(data.get("edition") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "edition must be a number"}), 400
+    words = str(data.get("words") or "default")
+    if words not in {"default", "1000", "2000"}:
+        words = "default"
+    linkedin = bool(data.get("linkedin"))
 
     if not topic:
         return jsonify({"error": "topic is required"}), 400
@@ -371,9 +382,12 @@ def api_start():
         topic,
         "--output-dir", str(OUTPUT_DIR),
         "--edition", str(edition),
+        "--words", words,
     ]
     if intent:
         cmd += ["--intent", intent]
+    if linkedin:
+        cmd.append("--linkedin")
 
     return jsonify({"job_id": _spawn(cmd)})
 
