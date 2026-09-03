@@ -155,6 +155,7 @@ python seo_writer.py "Semantic Caching for LLMs" --output-dir ./articles --editi
 | `--words` | Article length: `default` (2,500–3,500), `2000`, or `1000` |
 | `--linkedin` | Also write a LinkedIn post from the finished article |
 | `--video` | Also write a 2–3 minute video script, timed, with a visual per beat |
+| `--thumbnail` | Also design a LinkedIn share card, with a button to save it as a PNG |
 | `--audit FILE` | Audit a document you already have instead of writing a new one |
 | `--apply` | With `--audit`, also save the revised document |
 
@@ -352,6 +353,7 @@ Each run produces these files in `./output/`:
 | `<slug>_review.json` | The same argument as raw data |
 | `<slug>_linkedin.md` | LinkedIn post, with `--linkedin` |
 | `<slug>_video.md` | Video script, with `--video` |
+| `<slug>_thumbnail.html` | Share card, with `--thumbnail`. Open it and click to save a PNG |
 | `<slug>_usage.json` | Tokens and cost for this run, per model and per step |
 | `usage.jsonl` | One line per run — the rolling log behind `/usage` |
 

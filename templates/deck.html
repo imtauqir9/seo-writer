@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Visual track — {{ slug }}</title>
+<style>
+/* The video script's beats, presented. Fixed 1920x1080 scaled to fit, so a
+   screen capture is exactly 16:9 whatever size the window is. */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; background: #000; overflow: hidden;
+             font-family: "Segoe UI", Helvetica, Arial, sans-serif; }
+
+#stage { width: 1920px; height: 1080px; position: absolute; top: 50%; left: 50%;
+         transform-origin: center center; background: #0d0d0f; color: #fff;
+         overflow: hidden; }
+#stage::before { content: ""; position: absolute; inset: 0;
+  background-image: linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+                    linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+  background-size: 64px 64px; pointer-events: none; }
+
+.slide { position: absolute; inset: 0; display: none; flex-direction: column;
+         padding: 100px 120px; }
+.slide.live { display: flex; }
+
+.accent { position: absolute; left: 0; top: 0; bottom: 0; width: 8px;
+          background: linear-gradient(180deg, #6ee7a8, #3b9c6d); }
+
+.beat { font-size: 20px; font-weight: 700; letter-spacing: 3px;
+        text-transform: uppercase; color: #6ee7a8; }
+h2 { font-size: 64px; font-weight: 800; letter-spacing: -1.6px; line-height: 1.08;
+     margin-top: 22px; max-width: 1500px; }
+
+.visual { margin-top: 46px; padding: 28px 34px; background: #121216;
+          border-left: 4px solid #6ee7a8; font-size: 26px; line-height: 1.5;
+          color: #d8d8de; max-width: 1400px; }
+.visual span { display: block; font-size: 15px; letter-spacing: 2px;
+               text-transform: uppercase; color: #6b6b75; margin-bottom: 10px;
+               font-weight: 700; }
+
+.narration { margin-top: auto; font-size: 27px; line-height: 1.6; color: #8a8a93;
+             max-width: 1500px; border-top: 1px solid #232329; padding-top: 26px; }
+.narration.hidden { visibility: hidden; }
+
+.r { opacity: 0; transform: translateY(18px);
+     transition: opacity .5s ease, transform .5s ease; }
+.r.on { opacity: 1; transform: none; }
+
+#hud { position: fixed; left: 18px; bottom: 16px; z-index: 9; font-size: 13px;
+       color: #55555f; letter-spacing: 1px; font-family: Consolas, monospace;
+       background: rgba(0,0,0,.6); padding: 8px 12px; border-radius: 6px; }
+#hud.hidden { display: none; }
+#hud b { color: #6ee7a8; }
+
+.empty { position: absolute; inset: 0; display: flex; align-items: center;
+         justify-content: center; color: #8a8a93; font-size: 22px; text-align: center;
+         padding: 60px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  {% if not beats %}
+    <div class="empty">
+      No video script for <code style="color:#6ee7a8">{{ slug }}</code>.<br>
+      Generate the article again with the video script option ticked.
+    </div>
+  {% else %}
+    {% for b in beats %}
+      <section class="slide">
+        <div class="accent"></div>
+        <div class="beat r" data-step="1">{{ b.title }}</div>
+        <h2 class="r" data-step="1">{{ b.lines[0] if b.lines else b.visual }}</h2>
+        {% if b.visual %}
+          <div class="visual r" data-step="2"><span>On screen</span>{{ b.visual }}</div>
+        {% endif %}
+        {% if b.lines %}
+          <div class="narration r" data-step="3" id="nar-{{ loop.index }}">
+            {{ b.lines | join(' ') }}
+          </div>
+        {% endif %}
+      </section>
+    {% endfor %}
+  {% endif %}
+</div>
+
+<div id="hud">
+  <b id="beatName">—</b> &nbsp; <span id="stepNum"></span>
+  &nbsp;|&nbsp; SPACE next &nbsp; &larr; back &nbsp; N narration &nbsp; H hide
+</div>
+
+<script>
+const stage  = document.getElementById('stage');
+const slides = [...document.querySelectorAll('.slide')];
+const hud    = document.getElementById('hud');
+let slide = 0, step = 1, showNarration = true;
+
+const stepsIn = s => Math.max(0, ...[...s.querySelectorAll('[data-step]')]
+                                    .map(e => +e.dataset.step));
+
+function fit() {
+  const k = Math.min(innerWidth / 1920, innerHeight / 1080);
+  stage.style.transform = `translate(-50%, -50%) scale(${k})`;
+}
+addEventListener('resize', fit); fit();
+
+function render() {
+  if (!slides.length) return;
+  slides.forEach((s, i) => s.classList.toggle('live', i === slide));
+  const s = slides[slide];
+  s.querySelectorAll('[data-step]').forEach(el =>
+    el.classList.toggle('on', +el.dataset.step <= step));
+  // The narration is a teleprompter for the person recording, not part of the
+  // frame. N drops it out before you hit record.
+  s.querySelectorAll('.narration').forEach(el =>
+    el.classList.toggle('hidden', !showNarration));
+  document.getElementById('beatName').textContent = s.querySelector('.beat').textContent;
+  document.getElementById('stepNum').textContent = `step ${step}/${stepsIn(s)}`;
+}
+
+function next() {
+  if (step < stepsIn(slides[slide])) step++;
+  else if (slide < slides.length - 1) { slide++; step = 1; }
+  else return;
+  render();
+}
+function prev() {
+  if (step > 1) step--;
+  else if (slide > 0) { slide--; step = stepsIn(slides[slide]); }
+  else return;
+  render();
+}
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (e.key === ' ' || e.key === 'ArrowRight') { e.preventDefault(); next(); }
+  else if (e.key === 'ArrowLeft' || e.key === 'Backspace') { e.preventDefault(); prev(); }
+  else if (k === 'r') { slide = 0; step = 1; render(); }
+  else if (k === 'h') { hud.classList.toggle('hidden'); }
+  else if (k === 'n') { showNarration = !showNarration; render(); }
+});
+addEventListener('click', next);
+
+render();
+</script>
+</body>
+</html>

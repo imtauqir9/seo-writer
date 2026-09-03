@@ -459,6 +459,87 @@ def test_runtime_is_measured_from_narration_not_the_whole_document():
     assert len(narration.split()) < len(out.split())
 
 
+# --- the share card ---------------------------------------------------------
+
+COPY = {"kicker": "Model Context Protocol",
+        "lines": [{"text": "One protocol", "dim": False},
+                  {"text": "instead of", "dim": True},
+                  {"text": "M x N adapters", "dim": False}],
+        "subline": "Every host rebuilds the same connector. MCP is the standard."}
+
+
+def test_thumbnail_svg_carries_the_copy():
+    svg = sw.build_thumbnail_svg(COPY)
+    assert svg.startswith("<svg"), svg[:60]
+    assert 'width="1200" height="627"' in svg
+    for line in ("One protocol", "instead of", "M x N adapters"):
+        assert line in svg, line
+    assert "MODEL CONTEXT PROTOCOL" in svg, "the kicker should be upper-cased"
+    assert sw.AUTHOR_NAME in svg
+
+
+def test_dim_lines_render_grey_and_the_rest_white():
+    svg = sw.build_thumbnail_svg(COPY)
+    dim = svg.index("instead of")
+    assert '#7a7a84' in svg[max(0, dim - 200):dim], "a dim line should be grey"
+    solid = svg.index("One protocol")
+    assert '#ffffff' in svg[max(0, solid - 200):solid], "a solid line should be white"
+
+
+def test_thumbnail_escapes_markup_in_the_copy():
+    svg = sw.build_thumbnail_svg({"kicker": "a & b", "subline": '"quoted" <tag>',
+                                  "lines": [{"text": "x < y", "dim": False}]})
+    assert "&amp;" in svg and "&lt;" in svg
+    assert "<tag>" not in svg, "raw markup must not reach the SVG"
+
+
+def test_long_sublines_wrap_rather_than_overflow():
+    long = "word " * 60
+    assert len(sw._wrap(long, 52)) <= 3
+    assert all(len(l) <= 52 for l in sw._wrap(long, 52))
+
+
+def test_thumbnail_page_can_rasterise_itself():
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = sw.write_thumbnail("a-slug", COPY, sw.Path(d), "Title")
+        html = path.read_text(encoding="utf-8")
+    # No headless browser exists on the server, so the page converts its own
+    # SVG to PNG with a canvas.
+    assert "toBlob" in html and "canvas" in html
+    assert "Download 1200" in html and "Download 1280" in html
+    assert 'id="card"' in html
+
+
+def test_thumbnail_copy_is_built_from_the_article():
+    seen = {}
+
+    def fake_call(prompt, system="", max_tokens=16000, model=None, effort=None, **kw):
+        seen["prompt"] = prompt
+        return json.dumps(COPY)
+
+    real = sw.call_claude
+    sw.call_claude = fake_call
+    try:
+        out = sw.generate_thumbnail_copy("T", ARTICLE, {"keywords": {}})
+    finally:
+        sw.call_claude = real
+    assert "Semantic caching stores answers by meaning" in seen["prompt"]
+    assert "22 characters" in seen["prompt"], "the length limit must be explicit"
+    assert out["kicker"] == "Model Context Protocol"
+
+
+def test_thumbnail_copy_survives_a_model_that_returns_nothing_usable():
+    real = sw.call_claude
+    sw.call_claude = lambda *a, **k: json.dumps({"kicker": "", "lines": [], "subline": ""})
+    try:
+        out = sw.generate_thumbnail_copy("A Fallback Title", ARTICLE, {"keywords": {}})
+    finally:
+        sw.call_claude = real
+    assert out["lines"], "an empty line list must fall back to the title"
+    assert sw.build_thumbnail_svg(out).startswith("<svg")
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

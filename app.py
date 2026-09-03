@@ -15,6 +15,7 @@ import hmac
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -247,6 +248,7 @@ def list_articles() -> list[dict]:
         docx_file = docx_files[0].name if docx_files else None
         linkedin_path = OUTPUT_DIR / f"{slug}_linkedin.md"
         video_path = OUTPUT_DIR / f"{slug}_video.md"
+        thumb_path = OUTPUT_DIR / f"{slug}_thumbnail.html"
         review_path = OUTPUT_DIR / f"{slug}_review.json"
 
         word_count = 0
@@ -272,6 +274,7 @@ def list_articles() -> list[dict]:
             "image_count": len(meta.get("images", [])),
             "linkedin_file": linkedin_path.name if linkedin_path.exists() else None,
             "video_file": video_path.name if video_path.exists() else None,
+            "thumb_file": thumb_path.name if thumb_path.exists() else None,
             "has_review": review_path.exists(),
         })
     return articles
@@ -390,6 +393,7 @@ def api_start():
         words = "default"
     linkedin = bool(data.get("linkedin"))
     video = bool(data.get("video"))
+    thumbnail = bool(data.get("thumbnail"))
 
     if not topic:
         return jsonify({"error": "topic is required"}), 400
@@ -407,6 +411,8 @@ def api_start():
         cmd.append("--linkedin")
     if video:
         cmd.append("--video")
+    if thumbnail:
+        cmd.append("--thumbnail")
 
     return jsonify({"job_id": _spawn(cmd)})
 
@@ -606,6 +612,40 @@ def list_reviews() -> list[dict]:
             "agents": {k: v.get("model") for k, v in (record.get("agents") or {}).items()},
         })
     return out
+
+
+def parse_video_script(text: str) -> list[dict]:
+    """Split a generated script into its beats: heading, visual note, narration."""
+    beats, current = [], None
+    for line in text.splitlines():
+        if line.startswith("## Narration only"):
+            break
+        heading = re.match(r"^##\s+(.*)", line)
+        if heading:
+            if current:
+                beats.append(current)
+            current = {"title": heading.group(1).strip(), "visual": "", "lines": []}
+            continue
+        if current is None:
+            continue
+        visual = re.match(r"^\*\*Visual:\*\*\s*(.*)", line)
+        if visual:
+            current["visual"] = visual.group(1).strip()
+        elif line.strip() and not line.startswith("---"):
+            current["lines"].append(line.strip())
+    if current:
+        beats.append(current)
+    return [b for b in beats if b["lines"] or b["visual"]]
+
+
+@app.route("/deck/<slug>")
+def deck_page(slug):
+    """A presentable visual track built from the article's video script."""
+    path = OUTPUT_DIR / f"{Path(slug).name}_video.md"
+    if not path.exists():
+        return render_template("deck.html", beats=None, slug=slug), 404
+    beats = parse_video_script(path.read_text(encoding="utf-8"))
+    return render_template("deck.html", beats=beats, slug=slug)
 
 
 @app.route("/review/<slug>")

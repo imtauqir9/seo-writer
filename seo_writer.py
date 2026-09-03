@@ -1876,6 +1876,185 @@ teleprompter or a text-to-speech tool>"""
     return script
 
 
+def generate_thumbnail_copy(title: str, article: str, research: dict) -> dict:
+    """Headline copy for the share card, drawn from the finished article.
+
+    A thumbnail is read at a glance by someone scrolling past, so the copy is
+    constrained hard: a label, two or three very short lines, and one line of
+    substance. Anything longer stops being legible at feed size.
+    """
+    log("STEP 11", "Writing the thumbnail copy")
+
+    kw = research.get("keywords", {})
+
+    prompt = f"""Write the copy for a LinkedIn share card for the article below.
+
+It is read at a glance, at about a third of full size, by someone scrolling. The
+headline has to land the argument on its own.
+
+RULES
+- kicker: the subject, 3 to 5 words, no punctuation.
+- lines: 2 or 3 headline lines. Each is AT MOST 22 characters including spaces -
+  count them. Together they make one sentence or one contrast. Mark the
+  connecting words (of, becomes, instead of, is not) as dim; the words carrying
+  the meaning are not dim.
+- subline: one sentence, at most 130 characters, saying something specific. Not a
+  teaser, not a question, no "learn more". If the article makes a caveat worth
+  keeping, keep it.
+- No em dashes anywhere. No emoji. No hashtags.
+- Every claim must already be in the article.
+
+TOPIC
+{kw.get("primary_keyword", title)}
+
+THE ARTICLE
+{article[:6000]}
+
+Return ONLY valid JSON:
+{{
+  "kicker": "...",
+  "lines": [{{"text": "...", "dim": false}}, {{"text": "...", "dim": true}}],
+  "subline": "..."
+}}"""
+
+    copy = extract_json(call_claude(prompt, max_tokens=1500))
+
+    # The model agrees to 22 characters and then writes 30. Truncating silently
+    # would ship a broken card, so over-long lines are reported.
+    lines = [l for l in (copy.get("lines") or []) if l.get("text")][:3]
+    for line in lines:
+        if len(line["text"]) > 26:
+            print(f"  Line too long for the card ({len(line['text'])} chars): "
+                  f"{line['text']}")
+    copy["lines"] = lines or [{"text": title[:22], "dim": False}]
+    copy["kicker"] = _strip_em_dashes(str(copy.get("kicker") or ""))[:44]
+    copy["subline"] = _strip_em_dashes(str(copy.get("subline") or ""))[:150]
+    print(f"  Kicker : {copy['kicker']}")
+    print(f"  Lines  : {' / '.join(l['text'] for l in copy['lines'])}")
+    return copy
+
+
+def _svg_escape(text: str) -> str:
+    return (str(text).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Greedy word wrap, for the subline."""
+    words, lines, current = str(text).split(), [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) <= width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines[:3]
+
+
+def build_thumbnail_svg(copy: dict) -> str:
+    """The share card as one self-contained 1200x627 SVG.
+
+    SVG rather than HTML so the page can rasterise it to PNG in the browser with
+    a canvas, which means no headless browser has to exist on the server.
+    """
+    lines = copy.get("lines") or []
+    y = 214 if len(lines) >= 3 else 250
+    head = []
+    for line in lines:
+        colour = "#7a7a84" if line.get("dim") else "#ffffff"
+        head.append(
+            f'<text x="72" y="{y}" fill="{colour}" font-size="72" font-weight="800" '
+            f'letter-spacing="-2">{_svg_escape(line.get("text", ""))}</text>')
+        y += 86
+
+    sub = []
+    sy = y + 26
+    for part in _wrap(copy.get("subline", ""), 52):
+        sub.append(f'<text x="72" y="{sy}" fill="#b6b6bf" font-size="25">'
+                   f'{_svg_escape(part)}</text>')
+        sy += 36
+
+    grid = "".join(
+        f'<line x1="{x}" y1="0" x2="{x}" y2="627" stroke="#ffffff" stroke-opacity=".03"/>'
+        for x in range(48, 1200, 48)) + "".join(
+        f'<line x1="0" y1="{yy}" x2="1200" y2="{yy}" stroke="#ffffff" stroke-opacity=".03"/>'
+        for yy in range(48, 627, 48))
+
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="627"
+     viewBox="0 0 1200 627" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1200" height="627" fill="#0d0d0f"/>
+  {grid}
+  <rect x="0" y="0" width="8" height="627" fill="#6ee7a8"/>
+  <text x="72" y="96" fill="#6ee7a8" font-size="17" font-weight="700"
+        letter-spacing="2.6">{_svg_escape(str(copy.get("kicker", "")).upper())}</text>
+  {"".join(head)}
+  {"".join(sub)}
+  <text x="72" y="566" fill="#e8e8ee" font-size="19" font-weight="700">{_svg_escape(AUTHOR_NAME)}</text>
+  <text x="{72 + len(AUTHOR_NAME) * 11 + 18}" y="566" fill="#7c7c86" font-size="19">
+    &#8226; {_svg_escape(AUTHOR_URL.replace("https://", "").strip("/"))}</text>
+</svg>'''
+
+
+def write_thumbnail(slug: str, copy: dict, output_dir: Path, title: str = "") -> Path:
+    """A page holding the card, with a button that saves it as a 1200x627 PNG."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    svg = build_thumbnail_svg(copy)
+    path = output_dir / f"{slug}_thumbnail.html"
+    path.write_text(f'''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Thumbnail - {_svg_escape(title or slug)}</title>
+<style>
+  body {{ margin:0; background:#f5f5f5; font-family:"Segoe UI",Arial,sans-serif;
+         display:flex; flex-direction:column; align-items:center; gap:18px; padding:30px; }}
+  #card {{ box-shadow:0 4px 24px rgba(0,0,0,.25); max-width:100%; height:auto; }}
+  .bar {{ display:flex; gap:10px; align-items:center; }}
+  button {{ font:600 14px "Segoe UI",Arial; padding:10px 18px; border:none;
+            border-radius:6px; background:#111; color:#fff; cursor:pointer; }}
+  button:hover {{ background:#333; }}
+  .note {{ font-size:13px; color:#777; max-width:640px; text-align:center; line-height:1.5; }}
+</style></head><body>
+
+{svg.replace("<svg ", '<svg id="card" ', 1)}
+
+<div class="bar">
+  <button onclick="savePng(1200,627)">Download 1200 &times; 627 (feed)</button>
+  <button onclick="savePng(1280,720)">Download 1280 &times; 720 (article cover)</button>
+</div>
+<p class="note">The card is an SVG, so it is rasterised here in the browser
+rather than on the server. Edit the text in this file and reload to respin it.</p>
+
+<script>
+function savePng(w, h) {{
+  const svg = document.getElementById('card').outerHTML;
+  const img = new Image();
+  img.onload = () => {{
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#0d0d0f';
+    ctx.fillRect(0, 0, w, h);
+    // Letterbox rather than crop, so nothing is lost off the edge.
+    const k = Math.min(w / 1200, h / 627);
+    const dw = 1200 * k, dh = 627 * k;
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    c.toBlob(b => {{
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(b);
+      a.download = '{slug}_' + w + 'x' + h + '.png';
+      a.click();
+    }}, 'image/png');
+  }};
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+}}
+</script>
+</body></html>''', encoding="utf-8")
+    return path
+
+
 def insert_answer_block(article: str, answer: str) -> str:
     """Put the answer immediately after the H1, before anything else."""
     if not answer:
@@ -2632,7 +2811,7 @@ def review_stats(record: dict) -> dict:
 
 def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: str = "",
         verify: bool = True, verify_rounds: int = 2, words: str = "default",
-        linkedin: bool = False, video: bool = False):
+        linkedin: bool = False, video: bool = False, thumbnail: bool = False):
     profile = length_profile(words)
     # If intent is given and no explicit keywords, derive optimized search keywords
     if intent and not keywords:
@@ -2716,6 +2895,11 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
         video_path = output_dir / f"{slug}_video.md"
         video_path.write_text(script, encoding="utf-8")
 
+    thumb_path = None
+    if thumbnail:
+        copy = generate_thumbnail_copy(refined_title, humanized, research)
+        thumb_path = write_thumbnail(slug, copy, output_dir, refined_title)
+
     usage_path = write_usage(slug, output_dir, refined_title)
 
     # Summary
@@ -2737,6 +2921,8 @@ def run(title: str, keywords: str, output_dir: Path, edition: int = 0, intent: s
         print(f"  LinkedIn   : {linkedin_path}")
     if video_path:
         print(f"  Video      : {video_path}")
+    if thumb_path:
+        print(f"  Thumbnail  : {thumb_path}")
     print(f"  Usage JSON : {usage_path}")
     print_usage_summary()
     print(f"{'='*60}\n")
@@ -2906,6 +3092,12 @@ def main():
               "with a visual note per beat, saved as <slug>_video.md"),
     )
     parser.add_argument(
+        "--thumbnail",
+        action="store_true",
+        help=("Also write a LinkedIn share card from the finished article, as "
+              "<slug>_thumbnail.html with a button to save it as a PNG"),
+    )
+    parser.add_argument(
         "--audit",
         metavar="FILE",
         default=None,
@@ -2960,6 +3152,7 @@ def main():
             words=args.words,
             linkedin=args.linkedin,
             video=args.video,
+            thumbnail=args.thumbnail,
         )
     except ClaudeError as e:
         # Flattened to one line so the web UI, which reads the log line by line,

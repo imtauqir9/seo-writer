@@ -607,6 +607,87 @@ def test_the_client_listens_for_failed_and_handles_a_drop_separately():
             "the hardcoded fallback string should be gone"
 
 
+# --- the visual track deck --------------------------------------------------
+
+SCRIPT = """# T - video script
+
+## 1. Hook (0:00-0:15)
+**Visual:** Numbers filling in on screen.
+
+Every host rebuilds the same connector.
+
+## 2. The core idea (0:15-0:45)
+**Visual:** A diagram building.
+
+One interface for every tool.
+It is a standard, not a model.
+
+---
+
+## Narration only
+
+Every host rebuilds the same connector. One interface for every tool.
+"""
+
+
+def test_the_script_splits_into_beats():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        beats = m.parse_video_script(SCRIPT)
+    assert len(beats) == 2, beats
+    assert beats[0]["title"] == "1. Hook (0:00-0:15)"
+    assert beats[0]["visual"] == "Numbers filling in on screen."
+    assert beats[1]["lines"] == ["One interface for every tool.",
+                                 "It is a standard, not a model."]
+
+
+def test_the_narration_block_is_not_parsed_as_a_beat():
+    # It repeats every line; counting it would double the deck.
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        titles = [b["title"] for b in m.parse_video_script(SCRIPT)]
+    assert not any("Narration" in t for t in titles), titles
+
+
+def test_the_deck_renders_the_beats():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        (sw.Path(d) / "demo_video.md").write_text(SCRIPT, encoding="utf-8")
+        body = m.app.test_client().get("/deck/demo").data.decode()
+    assert "1. Hook (0:00-0:15)" in body
+    assert "Numbers filling in on screen." in body
+    assert "On screen" in body, "the visual note should be labelled"
+    assert "N narration" in body, "narration must be toggleable before recording"
+
+
+def test_a_missing_script_is_a_404_with_an_explanation():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        r = m.app.test_client().get("/deck/nothing")
+        assert r.status_code == 404
+        assert b"No video script" in r.data
+
+
+def test_the_deck_slug_cannot_escape_the_output_directory():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        assert m.app.test_client().get("/deck/..%2f..%2fetc%2fpasswd").status_code == 404
+
+
+def test_the_deck_is_behind_the_password():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d, password="s3cret")
+        assert m.app.test_client().get("/deck/demo").status_code == 302
+
+
+def test_the_form_offers_the_share_card():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        body = m.app.test_client().get("/").data.decode()
+        assert 'id="thumbnail"' in body
+        assert "Also design a LinkedIn share card" in body
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 

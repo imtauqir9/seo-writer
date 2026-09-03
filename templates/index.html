@@ -235,6 +235,10 @@
   .btn-rev:hover   { background: #eadff7; }
   .btn-vid   { color: #b03a2e; border-color: #e6b0aa; background: #fdf1ef; }
   .btn-vid:hover   { background: #fadfda; }
+  .btn-thumb { color: #1a7a6b; border-color: #9ed4cb; background: #eef8f6; }
+  .btn-thumb:hover { background: #d6f0ea; }
+  .btn-deck  { color: #7a5a00; border-color: #e0c67a; background: #fdf8ec; }
+  .btn-deck:hover  { background: #f8eecd; }
 
   .empty-state {
     color: #aaa;
@@ -365,6 +369,10 @@
         <input type="checkbox" id="video">
         <label for="video">Also write a 2-3 minute video script</label>
       </div>
+      <div class="checkline" style="margin-top:8px">
+        <input type="checkbox" id="thumbnail">
+        <label for="thumbnail">Also design a LinkedIn share card</label>
+      </div>
       <p class="hint" style="margin-top:4px">Both are written from the finished
         article, so they can only claim what it actually established. The script
         comes as timed beats with a visual note on each.</p>
@@ -409,6 +417,10 @@
             {% endif %}
             {% if a.video_file %}
             <a class="btn-link btn-vid" href="/output/{{ a.video_file }}" target="_blank">Video script</a>
+            <a class="btn-link btn-deck" href="/deck/{{ a.slug }}" target="_blank">Visual track</a>
+            {% endif %}
+            {% if a.thumb_file %}
+            <a class="btn-link btn-thumb" href="/output/{{ a.thumb_file }}" target="_blank">Share card</a>
             {% endif %}
             {% if a.has_review %}
             <a class="btn-link btn-rev" href="/review/{{ a.slug }}">Review</a>
@@ -464,6 +476,8 @@ function renderArticles(articles) {
         <a class="btn-link btn-md" href="/output/${encodeURIComponent(a.slug)}.md" target="_blank">Markdown</a>
         ${a.linkedin_file ? `<a class="btn-link btn-li" href="/output/${encodeURIComponent(a.linkedin_file)}" target="_blank">LinkedIn</a>` : ''}
         ${a.video_file ? `<a class="btn-link btn-vid" href="/output/${encodeURIComponent(a.video_file)}" target="_blank">Video script</a>` : ''}
+        ${a.video_file ? `<a class="btn-link btn-deck" href="/deck/${encodeURIComponent(a.slug)}" target="_blank">Visual track</a>` : ''}
+        ${a.thumb_file ? `<a class="btn-link btn-thumb" href="/output/${encodeURIComponent(a.thumb_file)}" target="_blank">Share card</a>` : ''}
         ${a.has_review ? `<a class="btn-link btn-rev" href="/review/${encodeURIComponent(a.slug)}">Review</a>` : ''}
       </div>
     </div>
@@ -647,6 +661,7 @@ form.addEventListener('submit', async (e) => {
   const words    = document.getElementById('words').value;
   const linkedin = document.getElementById('linkedin').checked;
   const video    = document.getElementById('video').checked;
+  const thumbnail = document.getElementById('thumbnail').checked;
 
   if (!topic) return;
 
@@ -657,6 +672,7 @@ form.addEventListener('submit', async (e) => {
     `Length : ${document.getElementById('words').selectedOptions[0].text}`,
     ...(linkedin ? ['Extra  : LinkedIn post'] : []),
     ...(video ? ['Extra  : video script'] : []),
+    ...(thumbnail ? ['Extra  : share card'] : []),
     ...(intent ? [`Intent : ${intent}`] : []),
     'Starting pipeline…\n',
   ]);
@@ -667,7 +683,7 @@ form.addEventListener('submit', async (e) => {
     const startResp = await fetch('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic, intent: intent || keywords, edition, words, linkedin, video }),
+      body: JSON.stringify({ topic, intent: intent || keywords, edition, words, linkedin, video, thumbnail }),
     });
     const startData = await startResp.json();
     if (startData.error) throw new Error(startData.error);
