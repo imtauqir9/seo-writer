@@ -62,7 +62,21 @@ SILENCE_LIMIT_SECS = 900
 
 # In-memory job store: job_id → queue.Queue
 _jobs: dict[str, queue.Queue] = {}
+_job_started: dict[str, float] = {}
 _jobs_lock = threading.Lock()
+
+# A job now outlives a dropped connection so the browser can reconnect to it.
+# Without a sweep, one abandoned tab would leak its queue for the life of the
+# process, and the pipeline keeps writing into it.
+JOB_RETENTION_SECS = 4 * 3600
+
+
+def _reap_jobs():
+    cutoff = time.time() - JOB_RETENTION_SECS
+    with _jobs_lock:
+        for jid in [j for j, started in _job_started.items() if started < cutoff]:
+            _jobs.pop(jid, None)
+            _job_started.pop(jid, None)
 
 
 # ---------------------------------------------------------------------------
@@ -403,10 +417,12 @@ def _spawn(cmd: list[str], review_baseline: set | None = None) -> str:
     Shared by generation and audit: both are the same pipeline script with
     different flags, and both want the same live log.
     """
+    _reap_jobs()
     job_id = str(uuid.uuid4())
     q: queue.Queue = queue.Queue()
     with _jobs_lock:
         _jobs[job_id] = q
+        _job_started[job_id] = time.time()
 
     def run():
         try:
@@ -619,7 +635,13 @@ def api_stream(job_id):
         return jsonify({"error": "job not found"}), 404
 
     def stream():
+        # "error" is a reserved EventSource event name: the browser fires it on
+        # any connection failure, with no data attached. Sending pipeline
+        # failures under that name made a dropped connection and a real failure
+        # arrive at the same handler, indistinguishable. They are sent as
+        # "failed" instead.
         silent = 0
+        finished = False
         try:
             while True:
                 try:
@@ -628,8 +650,9 @@ def api_stream(job_id):
                     silent += HEARTBEAT_SECS
                     if silent >= SILENCE_LIMIT_SECS:
                         minutes = SILENCE_LIMIT_SECS // 60
+                        finished = True
                         yield (
-                            "event: error\ndata: "
+                            "event: failed\ndata: "
                             + json.dumps({"message": f"The pipeline stopped "
                                                      f"responding after {minutes} "
                                                      f"minutes."})
@@ -643,14 +666,21 @@ def api_stream(job_id):
                 if kind == "log":
                     yield f"event: log\ndata: {json.dumps({'line': msg})}\n\n"
                 elif kind == "done":
+                    finished = True
                     yield f"event: done\ndata: {msg or '{}'}\n\n"
                     break
                 elif kind == "error":
-                    yield f"event: error\ndata: {json.dumps({'message': msg})}\n\n"
+                    finished = True
+                    yield f"event: failed\ndata: {json.dumps({'message': msg})}\n\n"
                     break
         finally:
-            with _jobs_lock:
-                _jobs.pop(job_id, None)
+            # Only forget the job once it actually ended. Dropping it on any
+            # disconnect defeated EventSource's own reconnect - the retry hit a
+            # 404 and gave up, while the pipeline carried on unwatched.
+            if finished:
+                with _jobs_lock:
+                    _jobs.pop(job_id, None)
+                    _job_started.pop(job_id, None)
 
     return Response(
         stream(),

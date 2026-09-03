@@ -503,8 +503,13 @@ tabAudit.addEventListener('click', () => setMode(true));
 // EventSource handling is written once.
 function streamJob(jobId, { onDone, onFail }) {
   const es = new EventSource(`/api/stream/${jobId}`);
+  let warnedDropped = false;
 
   es.addEventListener('log', (e) => {
+    if (warnedDropped) {
+      appendLog('Reconnected.', 'done');
+      warnedDropped = false;
+    }
     try { appendLog(JSON.parse(e.data).line); } catch { appendLog(e.data); }
   });
 
@@ -515,15 +520,30 @@ function streamJob(jobId, { onDone, onFail }) {
     await onDone(payload);
   });
 
-  es.addEventListener('error', async (e) => {
+  // The server sends real failures as "failed". "error" is reserved by
+  // EventSource for connection trouble and carries no data, so the two used to
+  // land on the same handler and every dropped connection read as a crash.
+  es.addEventListener('failed', async (e) => {
     es.close();
-    let msg = 'Pipeline error';
-    try { msg = JSON.parse(e.data).message; } catch {}
+    let msg = 'The pipeline failed without saying why.';
+    try { msg = JSON.parse(e.data).message || msg; } catch {}
     await onFail(msg);
   });
 
-  es.onerror = async () => {
-    if (es.readyState === EventSource.CLOSED) await onFail(null);
+  es.onerror = () => {
+    // EventSource retries on its own, and the job outlives the disconnect, so
+    // this is a pause rather than an ending. Say so instead of claiming the
+    // run died.
+    if (es.readyState === EventSource.CONNECTING && !warnedDropped) {
+      warnedDropped = true;
+      appendLog('\nConnection dropped. Reconnecting… the run is still going.', 'err');
+      return;
+    }
+    if (es.readyState === EventSource.CLOSED) {
+      appendLog('\nLost the connection to the server. The run may still be '
+                + 'finishing — check the article list in a few minutes.', 'err');
+      onFail(null);
+    }
   };
 }
 

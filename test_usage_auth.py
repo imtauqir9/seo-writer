@@ -535,6 +535,78 @@ def test_docx_headings_survive_the_conversion():
         assert "Some body text." in md
 
 
+# --- the job stream ---------------------------------------------------------
+
+def drain(m, job_id, limit=40):
+    """Collect SSE frames from the stream endpoint."""
+    r = m.app.test_client().get(f"/api/stream/{job_id}")
+    out = []
+    for chunk in r.response:
+        out.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        if len(out) >= limit:
+            break
+    return "".join(out)
+
+
+def test_a_failure_is_sent_as_failed_not_error():
+    # "error" is reserved by EventSource for connection trouble; sending
+    # pipeline failures under it made a dropped connection look like a crash.
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        q = m.queue.Queue()
+        with m._jobs_lock:
+            m._jobs["j1"] = q
+            m._job_started["j1"] = m.time.time()
+        q.put(("log", "starting"))
+        q.put(("error", "the model hit its cap"))
+        body = drain(m, "j1")
+    assert "event: failed" in body, body
+    assert "event: error" not in body, body
+    assert "the model hit its cap" in body
+
+
+def test_a_finished_job_is_forgotten():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        q = m.queue.Queue()
+        with m._jobs_lock:
+            m._jobs["j2"] = q
+            m._job_started["j2"] = m.time.time()
+        q.put(("done", '{"review_slug": "x"}'))
+        body = drain(m, "j2")
+        assert "event: done" in body, body
+        assert "j2" not in m._jobs, "a completed job should not be retained"
+
+
+def test_an_unknown_job_is_a_404():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        assert m.app.test_client().get("/api/stream/nope").status_code == 404
+
+
+def test_abandoned_jobs_are_swept_but_recent_ones_are_kept():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        with m._jobs_lock:
+            m._jobs["old"] = m.queue.Queue()
+            m._job_started["old"] = m.time.time() - m.JOB_RETENTION_SECS - 60
+            m._jobs["new"] = m.queue.Queue()
+            m._job_started["new"] = m.time.time()
+        m._reap_jobs()
+        assert "old" not in m._jobs, "an abandoned job should be swept"
+        assert "new" in m._jobs, "a live job must survive the sweep"
+
+
+def test_the_client_listens_for_failed_and_handles_a_drop_separately():
+    with tempfile.TemporaryDirectory() as d:
+        m = make_app(d)
+        body = m.app.test_client().get("/").data.decode()
+        assert "addEventListener('failed'" in body, "the client must listen for failed"
+        assert "Reconnecting" in body, "a drop should say it is reconnecting"
+        assert "'Pipeline error'" not in body, \
+            "the hardcoded fallback string should be gone"
+
+
 CASES = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
 
 
