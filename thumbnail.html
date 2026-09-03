@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LinkedIn thumbnail</title>
+<style>
+  /* ------------------------------------------------------------------
+     LinkedIn link-preview size. Change the text in the body, not here.
+     ------------------------------------------------------------------ */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #2a2a2a;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-start;
+    font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+
+  .card {
+    width: 1200px;
+    height: 627px;
+    background: #0d0d0f;
+    color: #fff;
+    position: relative;
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: 1fr 460px;
+  }
+
+  /* faint grid, so the flat black has some texture under the type */
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+
+  .left {
+    position: relative;
+    padding: 62px 0 56px 68px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .kicker {
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: 2.6px;
+    text-transform: uppercase;
+    color: #6ee7a8;
+  }
+
+  h1 {
+    font-size: 76px;
+    line-height: 1.03;
+    font-weight: 800;
+    letter-spacing: -2.4px;
+    margin-top: 26px;
+    max-width: 640px;
+  }
+  h1 .dim { color: #8a8a93; }
+
+  .sub {
+    font-size: 25px;
+    line-height: 1.42;
+    color: #b6b6bf;
+    margin-top: 24px;
+    max-width: 600px;
+    font-weight: 400;
+  }
+
+  .byline {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 19px;
+    color: #7c7c86;
+  }
+  .byline .name { color: #e8e8ee; font-weight: 700; }
+  .byline .dot { color: #44444c; }
+
+  /* ---- right panel: the idea, drawn ---- */
+  .right {
+    position: relative;
+    background: #121216;
+    border-left: 1px solid #1f1f26;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .right .cap {
+    position: absolute;
+    bottom: 34px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 15px;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: #55555f;
+    font-weight: 700;
+  }
+
+  .accent-bar {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 8px;
+    background: linear-gradient(180deg, #6ee7a8 0%, #3b9c6d 100%);
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="accent-bar"></div>
+
+  <div class="left">
+    <div>
+      <!-- EDIT: the small label above the title -->
+      <div class="kicker">Model Context Protocol</div>
+
+      <!-- EDIT: the headline. Wrap secondary words in <span class="dim"> -->
+      <h1>One protocol<br><span class="dim">instead of</span><br>M &times; N adapters</h1>
+
+      <!-- EDIT: one line of substance, not a teaser -->
+      <div class="sub">
+        Every host rebuilds the same GitHub connector. MCP is the standard
+        that stops it, and the cases where it is just overhead.
+      </div>
+    </div>
+
+    <div class="byline">
+      <span class="name">Imran Tauqir</span>
+      <span class="dot">&bull;</span>
+      <span>imrantauqir.com</span>
+    </div>
+  </div>
+
+  <div class="right">
+    <!-- The idea itself: a tangle resolving into a hub. -->
+    <svg width="360" height="330" viewBox="0 0 360 330" fill="none">
+      <!-- tangle (before) -->
+      <g opacity="0.30" stroke="#ff6b6b" stroke-width="2">
+        <line x1="42" y1="40" x2="150" y2="118"/>
+        <line x1="42" y1="40" x2="150" y2="62"/>
+        <line x1="42" y1="96" x2="150" y2="118"/>
+        <line x1="42" y1="96" x2="150" y2="62"/>
+        <line x1="42" y1="40" x2="150" y2="90"/>
+        <line x1="42" y1="96" x2="150" y2="90"/>
+      </g>
+      <g fill="#ff6b6b" opacity="0.55">
+        <circle cx="42" cy="40" r="7"/><circle cx="42" cy="96" r="7"/>
+        <circle cx="150" cy="62" r="7"/><circle cx="150" cy="90" r="7"/>
+        <circle cx="150" cy="118" r="7"/>
+      </g>
+      <text x="96" y="158" fill="#6b6b75" font-size="15" font-family="Segoe UI, Arial"
+            font-weight="700" text-anchor="middle" letter-spacing="1">M &#215; N</text>
+
+      <!-- arrow: the flow runs downward, tangle to hub -->
+      <path d="M180 172 L180 200 M170 190 L180 202 L190 190" stroke="#44444c"
+            stroke-width="2.5" fill="none" stroke-linecap="round"/>
+
+      <!-- hub (after) -->
+      <g stroke="#6ee7a8" stroke-width="2.5">
+        <line x1="180" y1="252" x2="90" y2="222"/>
+        <line x1="180" y1="252" x2="90" y2="288"/>
+        <line x1="180" y1="252" x2="270" y2="222"/>
+        <line x1="180" y1="252" x2="270" y2="288"/>
+      </g>
+      <g fill="#6ee7a8">
+        <circle cx="90" cy="222" r="8"/><circle cx="90" cy="288" r="8"/>
+        <circle cx="270" cy="222" r="8"/><circle cx="270" cy="288" r="8"/>
+      </g>
+      <rect x="156" y="232" width="48" height="40" rx="8" fill="#0d0d0f"
+            stroke="#6ee7a8" stroke-width="2.5"/>
+      <text x="180" y="258" fill="#6ee7a8" font-size="15" font-family="Segoe UI, Arial"
+            font-weight="800" text-anchor="middle">MCP</text>
+      <text x="180" y="316" fill="#6b6b75" font-size="15" font-family="Segoe UI, Arial"
+            font-weight="700" text-anchor="middle" letter-spacing="1">M + N</text>
+    </svg>
+    <div class="cap">the whole argument</div>
+  </div>
+</div>
+
+</body>
+</html>
